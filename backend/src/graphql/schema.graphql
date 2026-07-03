@@ -1,0 +1,220 @@
+scalar DateTime
+scalar JSON
+
+type Tenant {
+  id: ID!
+  name: String!
+  domain: String!
+  plan: String!
+  isActive: Boolean!
+}
+
+type User {
+  id: ID!
+  email: String!
+  firstName: String!
+  lastName: String!
+  role: String!
+  tenantId: ID!
+}
+
+type AuthPayload {
+  token: String!
+  refreshToken: String!
+  user: User!
+  tenant: Tenant!
+}
+
+type ErrorLog {
+  id: ID!
+  type: String!
+  message: String!
+  stackTrace: String
+  source: String
+  lineNumber: Int
+  columnNumber: Int
+  url: String!
+  userAgent: String!
+  timestamp: Float!
+  errorHash: String!
+  occurrenceCount: Int!
+  metadata: JSON
+  createdAt: DateTime!
+  updatedAt: DateTime
+}
+
+type ErrorPage {
+  total: Int!
+  page: Int!
+  pageSize: Int!
+  data: [ErrorLog!]!
+}
+
+type TrendData {
+  labels: [String!]!
+  values: [Float!]!
+}
+
+type TopError {
+  errorHash: String!
+  type: String!
+  message: String!
+  count: Int!
+  lastSeen: DateTime!
+}
+
+type PagePerformance {
+  url: String!
+  avgLoadTime: Float!
+  sampleCount: Int!
+}
+
+type DashboardStats {
+  totalErrors: Int!
+  totalEvents: Int!
+  avgLoadTime: Float!
+  errorRate: Float!
+  errorTrend: TrendData!
+  performanceTrend: TrendData!
+  topErrors: [TopError!]!
+  topSlowPages: [PagePerformance!]!
+}
+
+type PerformanceTimeSeriesPoint {
+  timestamp: DateTime!
+  avgLoadTime: Float!
+  avgTTFB: Float!
+  avgLCP: Float!
+  avgFCP: Float!
+  count: Int!
+}
+
+type DashboardLayout {
+  id: ID!
+  userId: ID!
+  name: String!
+  isDefault: Boolean!
+  configuration: JSON
+  createdAt: DateTime!
+  updatedAt: DateTime
+}
+
+input RegisterInput {
+  email: String!
+  password: String!
+  firstName: String!
+  lastName: String!
+  tenantName: String!
+  domain: String!
+}
+
+input LoginInput {
+  email: String!
+  password: String!
+}
+
+input SaveLayoutInput {
+  name: String!
+  isDefault: Boolean!
+  configuration: JSON
+}
+
+input PerformanceMetricsInput {
+  lcp: Float
+  fcp: Float
+  cls: Float
+  fid: Float
+  ttfb: Float
+  dns: Float
+  tcp: Float
+  response: Float
+  dom: Float
+  load: Float
+}
+
+input DeviceInfoInput {
+  type: String
+  browser: String
+  os: String
+  country: String
+}
+
+input IngestErrorInput {
+  type: String!
+  message: String!
+  stack: String
+  source: String
+  lineNo: Int
+  colNo: Int
+  url: String!
+  userAgent: String!
+  timestamp: Float!
+  metadata: JSON
+}
+
+input IngestPerformanceInput {
+  url: String!
+  userAgent: String!
+  timestamp: Float!
+  metrics: PerformanceMetricsInput!
+  device: DeviceInfoInput
+}
+
+input IngestApiErrorInput {
+  type: String!
+  requestUrl: String!
+  method: String!
+  status: Int
+  message: String
+  url: String!
+  userAgent: String!
+  timestamp: Float!
+  requestHeaders: JSON
+  responseHeaders: JSON
+}
+
+input IngestCustomEventInput {
+  name: String!
+  url: String!
+  userAgent: String!
+  timestamp: Float!
+  data: JSON!
+  userId: String
+  sessionId: String
+}
+
+input BatchIngestInput {
+  errors: [IngestErrorInput!]
+  performance: [IngestPerformanceInput!]
+  apiErrors: [IngestApiErrorInput!]
+  customEvents: [IngestCustomEventInput!]
+}
+
+type Query {
+  me: User!
+  dashboardStats(startDate: DateTime, endDate: DateTime): DashboardStats!
+  errors(page: Int = 1, pageSize: Int = 50, type: String, startDate: DateTime): ErrorPage!
+  errorDetails(id: ID!): ErrorLog!
+  performanceTimeSeries(
+    startDate: DateTime
+    endDate: DateTime
+    url: String
+    interval: String = "hour"
+  ): [PerformanceTimeSeriesPoint!]!
+  dashboardLayouts: [DashboardLayout!]!
+}
+
+type Mutation {
+  register(input: RegisterInput!): AuthPayload!
+  login(input: LoginInput!): AuthPayload!
+  changePassword(currentPassword: String!, newPassword: String!): Boolean!
+
+  saveDashboardLayout(input: SaveLayoutInput!): DashboardLayout!
+  deleteDashboardLayout(id: ID!): Boolean!
+
+  ingestError(input: IngestErrorInput!): Boolean!
+  ingestPerformance(input: IngestPerformanceInput!): Boolean!
+  ingestApiError(input: IngestApiErrorInput!): Boolean!
+  ingestCustomEvent(input: IngestCustomEventInput!): Boolean!
+  ingestBatch(input: BatchIngestInput!): Boolean!
+}

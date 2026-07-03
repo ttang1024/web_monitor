@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<title>Monitoring SDK Examples</title>
+		<style>
+			body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+			h2 { margin-top: 2rem; font-size: 1.1rem; }
+			button { margin: 0.2rem 0.3rem 0.2rem 0; padding: 0.4rem 0.8rem; cursor: pointer; }
+			p { color: #555; }
+		</style>
+	</head>
+	<body>
+		<h1>Monitoring SDK Examples</h1>
+		<p>
+			Serve this folder over HTTP (<code>npx serve ..</code> from <code>examples/</code>), start the
+			backend on <code>localhost:4000</code>, and watch batches in the network tab. Each button calls
+			one function from the example modules.
+		</p>
+
+		<h2>Error monitoring</h2>
+		<button data-run="throwUncaughtError">Uncaught error</button>
+		<button data-run="triggerUnhandledRejection">Unhandled rejection</button>
+		<button data-run="triggerResourceError">Resource error</button>
+		<button data-run="reportCaughtError">Caught error (manual)</button>
+		<button data-run="triggerRepeatedError">Repeated error (dedup)</button>
+
+		<h2>API monitoring</h2>
+		<button data-run="callMissingEndpoint">fetch → 404</button>
+		<button data-run="callUnreachableHost">fetch → network error</button>
+		<button data-run="callFailingXhr">XHR → 404</button>
+		<button data-run="reportApiErrorManually">Manual API error</button>
+
+		<h2>Page performance</h2>
+		<button data-run="triggerLayoutShift">Trigger layout shift (CLS)</button>
+		<button data-run="measureInteractionLatency">Measure interaction latency</button>
+		<button data-run="measureHeavyComputation">Measure heavy computation</button>
+
+		<h2>Business flows</h2>
+		<button data-run="patientFirstMessageCompleted">Patient message → completed</button>
+		<button data-run="patientFirstMessageFailed">Patient message → failed</button>
+		<button data-run="patientFirstMessageTimeout">Patient message → timeout (5s)</button>
+		<button data-run="checkoutFlow">Checkout → completed</button>
+
+		<h2>Custom events &amp; metrics</h2>
+		<button data-run="trackSignup">Signup event</button>
+		<button data-run="trackFeatureUsage">Feature usage</button>
+		<button data-run="trackPageView">Page view</button>
+		<button data-run="trackQueueDepth">Queue depth metric</button>
+		<button data-run="trackSearchLatency">Search latency metric</button>
+
+		<script src="../sdk/monitor.js"></script>
+		<script type="module">
+			import { createMonitor } from './basic-setup.js'
+			import * as errors from './error-monitoring.js'
+			import * as api from './api-monitoring.js'
+			import * as perf from './performance-monitoring.js'
+			import * as flows from './business-flows.js'
+			import * as custom from './custom-monitoring.js'
+
+			const monitor = createMonitor()
+			const functions = { ...errors, ...api, ...perf, ...flows, ...custom }
+
+			document.querySelectorAll('button[data-run]').forEach(button => {
+				button.addEventListener('click', () => functions[button.dataset.run](monitor))
+			})
+		</script>
+	</body>
+</html>

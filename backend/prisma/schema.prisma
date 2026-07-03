@@ -1,0 +1,188 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+enum SubscriptionPlan {
+  Free
+  Pro
+  Enterprise
+}
+
+enum UserRole {
+  User
+  Admin
+}
+
+model Tenant {
+  id                 String           @id @default(uuid()) @db.Char(36)
+  name               String
+  domain             String
+  plan               SubscriptionPlan @default(Free)
+  isActive           Boolean          @default(true)
+  maxUsers           Int              @default(5)
+  maxApiKeys         Int              @default(3)
+  monthlyEventLimit  BigInt           @default(100000)
+  currentMonthEvents BigInt           @default(0)
+  monthlyResetDate   DateTime
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime?        @updatedAt
+
+  users             User[]
+  apiKeys           ApiKey[]
+  errorLogs         ErrorLog[]
+  performanceMetrics PerformanceMetric[]
+  apiErrors         ApiError[]
+  customEvents      CustomEvent[]
+  dashboardLayouts  DashboardLayout[]
+}
+
+model User {
+  id           String    @id @default(uuid()) @db.Char(36)
+  tenantId     String    @db.Char(36)
+  email        String
+  passwordHash String
+  firstName    String
+  lastName     String
+  role         UserRole  @default(User)
+  isActive     Boolean   @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime? @updatedAt
+
+  tenant           Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  dashboardLayouts DashboardLayout[]
+
+  @@index([email])
+  @@index([tenantId])
+}
+
+model ApiKey {
+  id             String    @id @default(uuid()) @db.Char(36)
+  tenantId       String    @db.Char(36)
+  name           String
+  key            String    @unique
+  isActive       Boolean   @default(true)
+  expiresAt      DateTime?
+  lastUsedAt     DateTime?
+  environment    String    @default("production")
+  allowedOrigins Json?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime? @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+}
+
+model ErrorLog {
+  id              String    @id @default(uuid()) @db.Char(36)
+  tenantId        String    @db.Char(36)
+  type            String
+  message         String    @db.Text
+  stackTrace      String?   @db.Text
+  source          String?
+  lineNumber      Int?
+  columnNumber    Int?
+  url             String    @db.Text
+  userAgent       String    @db.Text
+  timestamp       BigInt
+  errorHash       String
+  occurrenceCount Int       @default(1)
+  metadata        Json?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime? @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, errorHash])
+}
+
+model PerformanceMetric {
+  id            String    @id @default(uuid()) @db.Char(36)
+  tenantId      String    @db.Char(36)
+  url           String    @db.Text
+  userAgent     String    @db.Text
+  timestamp     BigInt
+  lcp           Float?
+  fcp           Float?
+  cls           Float?
+  fid           Float?
+  ttfb          Float?
+  dnsTime       Float?
+  tcpTime       Float?
+  responseTime  Float?
+  domLoadTime   Float?
+  loadTime      Float?
+  deviceType    String?
+  browser       String?
+  os            String?
+  country       String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime? @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, createdAt])
+}
+
+model ApiError {
+  id              String    @id @default(uuid()) @db.Char(36)
+  tenantId        String    @db.Char(36)
+  type            String
+  requestUrl      String    @db.Text
+  method          String    @default("GET")
+  statusCode      Int?
+  errorMessage    String?   @db.Text
+  pageUrl         String    @db.Text
+  userAgent       String    @db.Text
+  timestamp       BigInt
+  requestHeaders  Json?
+  responseHeaders Json?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime? @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, createdAt])
+}
+
+model CustomEvent {
+  id        String    @id @default(uuid()) @db.Char(36)
+  tenantId  String    @db.Char(36)
+  eventName String
+  url       String    @db.Text
+  userAgent String    @db.Text
+  timestamp BigInt
+  data      Json?
+  userId    String?
+  sessionId String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime? @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, eventName, createdAt])
+}
+
+model DashboardLayout {
+  id            String    @id @default(uuid()) @db.Char(36)
+  tenantId      String    @db.Char(36)
+  userId        String    @db.Char(36)
+  name          String    @default("Default Dashboard")
+  isDefault     Boolean   @default(false)
+  configuration Json?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime? @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([userId])
+}

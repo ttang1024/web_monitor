@@ -1,0 +1,15 @@
+services:
+  mysql:
+    image: mysql:8
+    container_name: monitoring-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: yourpassword
+      MYSQL_DATABASE: monitoring_saas
+    ports:
+      - '3306:3306'
+    volumes:
+      - monitoring-mysql-data:/var/lib/mysql
+
+volumes:
+  monitoring-mysql-data:
