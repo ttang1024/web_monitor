@@ -35,7 +35,11 @@ import {
   Github,
   Eye,
   EyeOff,
-  Calendar
+  Calendar,
+  Copy,
+  KeyRound,
+  Code2,
+  Ban
 } from 'lucide-react';
 
 export const Icons = {
@@ -75,5 +79,9 @@ export const Icons = {
   Github,
   Eye,
   EyeOff,
-  Calendar
+  Calendar,
+  Copy,
+  Key: KeyRound,
+  Code: Code2,
+  Ban
 };

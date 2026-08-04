@@ -7,7 +7,7 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 .claude
-
+tech_doc
 node_modules
 dist
 dist-ssr

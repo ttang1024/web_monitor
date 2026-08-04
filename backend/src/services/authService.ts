@@ -1,6 +1,13 @@
 import { prisma } from '../prisma.js'
 import { UnauthorizedError, NotFoundError, BadRequestError } from '../lib/errors.js'
-import { generateJwtToken, generateRefreshToken, hashPassword, verifyPassword } from '../lib/auth.js'
+import {
+  generateJwtToken,
+  generateRefreshToken,
+  hashPassword,
+  hashRefreshToken,
+  refreshTokenExpiry,
+  verifyPassword,
+} from '../lib/auth.js'
 import * as tenantService from './tenantService.js'
 import type { LoginInput, RegisterInput } from '../types.js'
 import type { Tenant, User } from '@prisma/client'
@@ -50,6 +57,26 @@ function toTenantDto(tenant: Tenant): TenantDto {
   }
 }
 
+/** Issues an access token plus a persisted (hashed) refresh token. */
+async function issueSession(user: User, tenant: Tenant): Promise<LoginResponse> {
+  const refreshToken = generateRefreshToken()
+
+  await prisma.refreshToken.create({
+    data: {
+      userId: user.id,
+      tokenHash: hashRefreshToken(refreshToken),
+      expiresAt: refreshTokenExpiry(),
+    },
+  })
+
+  return {
+    token: generateJwtToken(user, tenant),
+    refreshToken,
+    user: toUserDto(user),
+    tenant: toTenantDto(tenant),
+  }
+}
+
 export async function register(input: RegisterInput): Promise<LoginResponse> {
   const existingUser = await prisma.user.findFirst({ where: { email: input.email } })
   if (existingUser) {
@@ -70,10 +97,7 @@ export async function register(input: RegisterInput): Promise<LoginResponse> {
     },
   })
 
-  const token = generateJwtToken(user, tenant)
-  const refreshToken = generateRefreshToken()
-
-  return { token, refreshToken, user: toUserDto(user), tenant: toTenantDto(tenant) }
+  return issueSession(user, tenant)
 }
 
 export async function login(input: LoginInput): Promise<LoginResponse> {
@@ -95,16 +119,55 @@ export async function login(input: LoginInput): Promise<LoginResponse> {
     data: { lastLoginAt: new Date() },
   })
 
-  const token = generateJwtToken(updated, user.tenant)
-  const refreshToken = generateRefreshToken()
+  return issueSession(updated, user.tenant)
+}
 
-  return { token, refreshToken, user: toUserDto(updated), tenant: toTenantDto(user.tenant) }
+/**
+ * Exchanges a refresh token for a new session. The old token is revoked as
+ * part of the swap (rotation), so a stolen token is usable at most once.
+ */
+export async function refreshSession(refreshToken: string): Promise<LoginResponse> {
+  const tokenHash = hashRefreshToken(refreshToken)
+  const stored = await prisma.refreshToken.findUnique({
+    where: { tokenHash },
+    include: { user: { include: { tenant: true } } },
+  })
+
+  if (!stored || stored.revokedAt || stored.expiresAt < new Date()) {
+    throw new UnauthorizedError('Invalid or expired refresh token')
+  }
+
+  if (!stored.user.isActive || !stored.user.tenant.isActive) {
+    throw new UnauthorizedError('Account is inactive')
+  }
+
+  await prisma.refreshToken.update({
+    where: { id: stored.id },
+    data: { revokedAt: new Date() },
+  })
+
+  return issueSession(stored.user, stored.user.tenant)
+}
+
+/** Revokes one refresh token (this device) or, with no token, every session. */
+export async function logout(userId: string, refreshToken?: string | null): Promise<void> {
+  const where = refreshToken
+    ? { userId, tokenHash: hashRefreshToken(refreshToken), revokedAt: null }
+    : { userId, revokedAt: null }
+
+  await prisma.refreshToken.updateMany({ where, data: { revokedAt: new Date() } })
 }
 
 export async function getUserById(userId: string): Promise<UserDto> {
   const user = await prisma.user.findUnique({ where: { id: userId } })
   if (!user) throw new NotFoundError('User not found')
   return toUserDto(user)
+}
+
+export async function getTenantById(tenantId: string): Promise<TenantDto> {
+  const tenant = await prisma.tenant.findUnique({ where: { id: tenantId } })
+  if (!tenant) throw new NotFoundError('Tenant not found')
+  return toTenantDto(tenant)
 }
 
 export async function changePassword(userId: string, currentPassword: string, newPassword: string): Promise<void> {
@@ -118,5 +181,11 @@ export async function changePassword(userId: string, currentPassword: string, ne
   await prisma.user.update({
     where: { id: userId },
     data: { passwordHash: hashPassword(newPassword) },
+  })
+
+  // A password change invalidates every session issued under the old one.
+  await prisma.refreshToken.updateMany({
+    where: { userId, revokedAt: null },
+    data: { revokedAt: new Date() },
   })
 }

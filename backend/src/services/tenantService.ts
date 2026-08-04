@@ -1,10 +1,6 @@
-import { randomBytes } from 'node:crypto'
 import type { Tenant } from '@prisma/client'
 import { prisma } from '../prisma.js'
-
-function generateApiKey(): string {
-  return `sk_${randomBytes(16).toString('hex')}${randomBytes(16).toString('hex')}`
-}
+import { generateApiKey } from './apiKeyService.js'
 
 function nextMonthlyResetDate(from: Date = new Date()): Date {
   const date = new Date(from)

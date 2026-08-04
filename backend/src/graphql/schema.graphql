@@ -1,6 +1,29 @@
 scalar DateTime
 scalar JSON
 
+enum ErrorStatus {
+  Unresolved
+  Resolved
+  Ignored
+  Regressed
+}
+
+"""
+The ingestion credential a page's SDK authenticates with. Returned in full to
+authenticated members of the owning tenant — there is no other way to install
+the SDK.
+"""
+type ApiKey {
+  id: ID!
+  name: String!
+  key: String!
+  environment: String!
+  isActive: Boolean!
+  lastUsedAt: DateTime
+  expiresAt: DateTime
+  createdAt: DateTime!
+}
+
 type Tenant {
   id: ID!
   name: String!
@@ -38,9 +61,85 @@ type ErrorLog {
   timestamp: Float!
   errorHash: String!
   occurrenceCount: Int!
+  status: ErrorStatus!
+  lastSeenAt: DateTime!
   metadata: JSON
   createdAt: DateTime!
   updatedAt: DateTime
+}
+
+type ErrorStatusCounts {
+  unresolved: Int!
+  resolved: Int!
+  ignored: Int!
+  regressed: Int!
+}
+
+type ErrorTrendPoint {
+  bucketStart: DateTime!
+  count: Int!
+}
+
+type ApiErrorLog {
+  id: ID!
+  type: String!
+  requestUrl: String!
+  method: String!
+  statusCode: Int
+  errorMessage: String
+  pageUrl: String!
+  userAgent: String!
+  timestamp: Float!
+  createdAt: DateTime!
+}
+
+type ApiErrorPage {
+  total: Int!
+  page: Int!
+  pageSize: Int!
+  data: [ApiErrorLog!]!
+}
+
+type CustomEventLog {
+  id: ID!
+  eventName: String!
+  url: String!
+  timestamp: Float!
+  data: JSON
+  userId: String
+  sessionId: String
+  createdAt: DateTime!
+}
+
+type CustomEventPage {
+  total: Int!
+  page: Int!
+  pageSize: Int!
+  data: [CustomEventLog!]!
+}
+
+type BusinessFlowStat {
+  flow: String!
+  total: Int!
+  completed: Int!
+  failed: Int!
+  timedOut: Int!
+  abandoned: Int!
+  avgDurationMs: Float!
+}
+
+type WebVitals {
+  lcp: Float
+  fcp: Float
+  cls: Float
+  fid: Float
+  ttfb: Float
+  sampleCount: Int!
+}
+
+type BreakdownSlice {
+  name: String!
+  count: Int!
 }
 
 type ErrorPage {
@@ -111,6 +210,11 @@ input RegisterInput {
 input LoginInput {
   email: String!
   password: String!
+}
+
+input CreateApiKeyInput {
+  name: String!
+  environment: String = "production"
 }
 
 input SaveLayoutInput {
@@ -192,22 +296,50 @@ input BatchIngestInput {
 
 type Query {
   me: User!
+  myTenant: Tenant!
+  apiKeys: [ApiKey!]!
   dashboardStats(startDate: DateTime, endDate: DateTime): DashboardStats!
-  errors(page: Int = 1, pageSize: Int = 50, type: String, startDate: DateTime): ErrorPage!
+  errors(
+    page: Int = 1
+    pageSize: Int = 50
+    type: String
+    status: ErrorStatus
+    search: String
+    startDate: DateTime
+  ): ErrorPage!
+  errorStatusCounts: ErrorStatusCounts!
   errorDetails(id: ID!): ErrorLog!
+  "Hourly occurrence counts for one error group, zero-filled."
+  errorTimeSeries(errorHash: String!, hours: Int = 24): [ErrorTrendPoint!]!
   performanceTimeSeries(
     startDate: DateTime
     endDate: DateTime
     url: String
     interval: String = "hour"
   ): [PerformanceTimeSeriesPoint!]!
+  "P75 of each Web Vital over the window."
+  webVitals(startDate: DateTime, endDate: DateTime): WebVitals!
+  deviceBreakdown(dimension: String = "browser", startDate: DateTime, endDate: DateTime): [BreakdownSlice!]!
+  apiErrors(page: Int = 1, pageSize: Int = 50, startDate: DateTime): ApiErrorPage!
+  customEvents(page: Int = 1, pageSize: Int = 50, name: String, startDate: DateTime): CustomEventPage!
+  "Completion/failure rates per business flow tracked with startFlow()."
+  businessFlows(startDate: DateTime, endDate: DateTime): [BusinessFlowStat!]!
   dashboardLayouts: [DashboardLayout!]!
 }
 
 type Mutation {
   register(input: RegisterInput!): AuthPayload!
   login(input: LoginInput!): AuthPayload!
+  "Exchanges a refresh token for a new session; the old token is rotated out."
+  refreshSession(refreshToken: String!): AuthPayload!
+  "Revokes the given refresh token, or every session for the user when omitted."
+  logout(refreshToken: String): Boolean!
   changePassword(currentPassword: String!, newPassword: String!): Boolean!
+
+  createApiKey(input: CreateApiKeyInput!): ApiKey!
+  revokeApiKey(id: ID!): ApiKey!
+
+  updateErrorStatus(id: ID!, status: ErrorStatus!): ErrorLog!
 
   saveDashboardLayout(input: SaveLayoutInput!): DashboardLayout!
   deleteDashboardLayout(id: ID!): Boolean!

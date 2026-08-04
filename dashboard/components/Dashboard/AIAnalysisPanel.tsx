@@ -5,10 +5,12 @@ import { DashboardState, AIAnalysisResponse } from '../../types';
 
 interface Props {
   dashboardState: DashboardState;
+  /** Live metrics for the current window, serialized for the model. */
+  metricsSummary: string;
   onClose: () => void;
 }
 
-export const AIAnalysisPanel: React.FC<Props> = ({ dashboardState, onClose }) => {
+export const AIAnalysisPanel: React.FC<Props> = ({ dashboardState, metricsSummary, onClose }) => {
   const [loading, setLoading] = useState(false);
   const [analysis, setAnalysis] = useState<AIAnalysisResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -17,13 +19,6 @@ export const AIAnalysisPanel: React.FC<Props> = ({ dashboardState, onClose }) =>
     setLoading(true);
     setError(null);
     try {
-      // Mocking the summary data structure that would be passed to the LLM
-      const metricsSummary = JSON.stringify({
-        errors: { current: "2.4%", trend: "+0.5%" },
-        lcp: { current: "2.8s", threshold: "2.5s" },
-        api_latency: { p95: "450ms", status: "degraded" }
-      });
-
       const result = await analyzeDashboard(dashboardState, metricsSummary);
       setAnalysis(result);
     } catch (err: any) {

@@ -24,6 +24,14 @@ export const ReplaysPage: React.FC<ReplaysPageProps> = () => {
           </div>
       </div>
 
+      <div className="p-4 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-900/50 text-sm text-amber-800 dark:text-amber-300 flex items-start gap-2">
+        <Icons.AlertTriangle size={16} className="mt-0.5 shrink-0" />
+        <span>
+          <strong>Sample data.</strong> The SDK does not record session replays yet, so these rows are placeholders —
+          every other page shows live data from your own events.
+        </span>
+      </div>
+
       <div className="grid grid-cols-1 gap-4">
         {MOCK_REPLAYS.map((replay) => (
           <div key={replay.id} className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-4 flex flex-col sm:flex-row items-center justify-between gap-6 hover:border-slate-300 dark:hover:border-slate-700 transition-all group shadow-sm">

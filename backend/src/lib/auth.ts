@@ -1,14 +1,8 @@
 import jwt from 'jsonwebtoken'
 import bcrypt from 'bcryptjs'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import type { Tenant, User } from '@prisma/client'
-
-const JWT_SECRET = process.env.JWT_SECRET ?? ''
-if (!JWT_SECRET) {
-  throw new Error('JWT_SECRET not configured')
-}
-const JWT_ISSUER = process.env.JWT_ISSUER
-const JWT_AUDIENCE = process.env.JWT_AUDIENCE
+import { env } from './env.js'
 
 export interface AuthClaims {
   userId: string
@@ -27,23 +21,34 @@ export function generateJwtToken(user: User, tenant: Tenant): string {
     tenantName: tenant.name,
   }
 
-  return jwt.sign(claims, JWT_SECRET, {
-    issuer: JWT_ISSUER,
-    audience: JWT_AUDIENCE,
-    expiresIn: '24h',
+  return jwt.sign(claims, env.JWT_SECRET, {
+    issuer: env.JWT_ISSUER,
+    audience: env.JWT_AUDIENCE,
+    expiresIn: env.ACCESS_TOKEN_TTL as jwt.SignOptions['expiresIn'],
     jwtid: randomBytes(16).toString('hex'),
   })
 }
 
 export function verifyJwtToken(token: string): AuthClaims {
-  return jwt.verify(token, JWT_SECRET, {
-    issuer: JWT_ISSUER,
-    audience: JWT_AUDIENCE,
+  return jwt.verify(token, env.JWT_SECRET, {
+    issuer: env.JWT_ISSUER,
+    audience: env.JWT_AUDIENCE,
   }) as AuthClaims
 }
 
 export function generateRefreshToken(): string {
-  return randomBytes(32).toString('base64')
+  return randomBytes(32).toString('base64url')
+}
+
+// Refresh tokens are stored as digests, so a leaked table row cannot be
+// replayed as a token. SHA-256 is enough here: the token is 256 bits of
+// entropy, so there is nothing to brute-force the way there is with a password.
+export function hashRefreshToken(token: string): string {
+  return createHash('sha256').update(token).digest('hex')
+}
+
+export function refreshTokenExpiry(from = new Date()): Date {
+  return new Date(from.getTime() + env.REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000)
 }
 
 export function hashPassword(password: string): string {

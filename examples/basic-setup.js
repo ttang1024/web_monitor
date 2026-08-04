@@ -1,8 +1,10 @@
 // Basic SDK setup: create a configured monitor instance and identify the user.
 // All other examples take this instance as their first argument.
 
+import MonitoringSDK from '../sdk/monitor.js'
+
 export function createMonitor(apiKey = 'sk_your_api_key_here') {
-	const monitor = new window.MonitoringSDK(apiKey, {
+	const monitor = new MonitoringSDK(apiKey, {
 		baseUrl: 'http://localhost:4000',
 		batchSize: 10, // send after 10 queued events…
 		flushInterval: 3000, // …or every 3 seconds, whichever comes first

@@ -43,11 +43,13 @@ export interface WidgetConfig {
   h: number; // grid height (row span)
 }
 
+/** A project is an API key: the credential a page reports with. */
 export interface Application {
   id: string;
   name: string;
-  framework: 'react' | 'vue' | 'angular' | 'next' | 'node';
-  health: 'healthy' | 'warning' | 'critical';
+  environment: string;
+  apiKey: string;
+  isActive: boolean;
 }
 
 export interface DashboardState {

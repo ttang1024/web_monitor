@@ -12,7 +12,9 @@ export default defineConfig(({ mode }) => {
       plugins: [react()],
       define: {
         'process.env.API_KEY': JSON.stringify(env.GEMINI_API_KEY),
-        'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY)
+        'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
+        // Monitoring API the dashboard reads from.
+        'process.env.API_URL': JSON.stringify(env.API_URL || 'http://localhost:4000/graphql')
       },
       resolve: {
         alias: {

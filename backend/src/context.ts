@@ -2,8 +2,8 @@ import type { IncomingHttpHeaders } from 'node:http'
 import { verifyJwtToken } from './lib/auth.js'
 import type { GraphQLContext } from './types.js'
 
-export function buildContext(headers: IncomingHttpHeaders): GraphQLContext {
-  const context: GraphQLContext = {}
+export function buildContext(headers: IncomingHttpHeaders, ip?: string): GraphQLContext {
+  const context: GraphQLContext = { ip }
 
   const authHeader = headers.authorization
   if (authHeader?.startsWith('Bearer ')) {

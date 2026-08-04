@@ -16,6 +16,8 @@ const DEFAULT_OPTIONS = {
 	flowTimeout: 30000,
 	instrumentFetch: true,
 	instrumentXhr: true,
+	// Ceiling for the backoff applied after failed flushes.
+	maxRetryDelay: 5 * 60 * 1000,
 }
 
 class MonitoringSDK {
@@ -30,6 +32,8 @@ class MonitoringSDK {
 		this.observers = []
 		this.flowCounter = 0
 		this.finalized = false
+		this.consecutiveFailures = 0
+		this.nextRetryAt = 0
 
 		this.userId = this.options.userId || null
 		this.sessionId = this.resolveSessionId()
@@ -457,8 +461,17 @@ class MonitoringSDK {
 		return batch
 	}
 
+	// A response the backend will never accept — bad API key, malformed or
+	// oversized payload. Retrying it just burns requests forever, so it is
+	// dropped. 408/429 are the exceptions: those do succeed later.
+	isPermanentFailure(status) {
+		return status >= 400 && status < 500 && status !== 408 && status !== 429
+	}
+
 	async flush({ final = false } = {}) {
 		if (this.batchQueue.length === 0 || !this.transportFetch) return
+		// Backing off after a failure — but a final flush always tries.
+		if (!final && Date.now() < this.nextRetryAt) return
 
 		const items = this.batchQueue
 		this.batchQueue = []
@@ -477,12 +490,50 @@ class MonitoringSDK {
 				// keepalive lets the final flush survive page unload.
 				keepalive: final,
 			})
-			if (!response.ok) throw new Error(`HTTP ${response.status}`)
+
+			if (!response.ok) {
+				if (this.isPermanentFailure(response.status)) {
+					this.onFlushSucceeded()
+					if (!final) console.error(`Monitoring batch rejected (HTTP ${response.status}), dropped`)
+					return
+				}
+				throw new Error(`HTTP ${response.status}`)
+			}
+
+			// GraphQL reports rejected input as 200 + an errors array. Those are
+			// permanent too, so the batch is dropped rather than replayed.
+			if (!final) {
+				const body = await response.json().catch(() => null)
+				if (body?.errors?.length) {
+					this.onFlushSucceeded()
+					console.error('Monitoring batch rejected:', body.errors[0]?.message)
+					return
+				}
+			}
+
+			this.onFlushSucceeded()
 		} catch (error) {
-			// Put the items back so the next interval retries them.
+			// Put the items back so a later interval retries them.
 			this.batchQueue = [...items, ...this.batchQueue].slice(-this.options.maxQueueSize)
+			this.onFlushFailed()
 			if (!final) console.error('Failed to send monitoring data:', error)
 		}
+	}
+
+	onFlushSucceeded() {
+		this.consecutiveFailures = 0
+		this.nextRetryAt = 0
+	}
+
+	// Exponential backoff with jitter: a backend that is down (or a browser that
+	// is offline) sees one retry every few minutes instead of one every tick.
+	onFlushFailed() {
+		this.consecutiveFailures += 1
+		const delay = Math.min(
+			this.options.flushInterval * 2 ** (this.consecutiveFailures - 1),
+			this.options.maxRetryDelay
+		)
+		this.nextRetryAt = Date.now() + delay * (0.5 + Math.random() * 0.5)
 	}
 
 	// Called when the page is hidden or unloading: close out vitals and
@@ -514,10 +565,11 @@ class MonitoringSDK {
 	}
 }
 
+// Also exposed as a global so the SDK can be dropped in with a plain
+// <script type="module" src="monitor.js"> and used as window.MonitoringSDK.
 if (typeof window !== 'undefined') {
 	window.MonitoringSDK = MonitoringSDK
 }
-if (typeof module !== 'undefined' && module.exports) {
-	module.exports = MonitoringSDK
-	module.exports.default = MonitoringSDK
-}
+
+export default MonitoringSDK
+export { MonitoringSDK }

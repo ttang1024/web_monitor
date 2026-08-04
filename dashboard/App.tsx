@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { Icons } from './components/ui/Icons';
 import { Widget } from './components/Dashboard/Widget';
 import { AIAnalysisPanel } from './components/Dashboard/AIAnalysisPanel';
@@ -9,16 +9,30 @@ import { PerformancePage } from './components/Pages/PerformancePage';
 import { ReplaysPage } from './components/Pages/ReplaysPage';
 import { OverviewPage } from './components/Pages/OverviewPage';
 import { AuthPage } from './components/Pages/AuthPage';
-import { DashboardState, WidgetConfig, TimeRange, Environment, ChartType, MetricType, Page, Application, CustomTimeRange } from './types';
-import { INITIAL_WIDGETS, MOCK_SUMMARY_METRICS, MOCK_APPS } from './constants';
+import { DashboardState, WidgetConfig, TimeRange, Environment, ChartType, MetricType, Page, CustomTimeRange } from './types';
+import { INITIAL_WIDGETS } from './constants';
+import { AuthPayload, Tenant, User, logout as apiLogout, dashboardStats, me, session } from './services/api';
+import { useApi } from './hooks/useApi';
+import { toDateRange } from './services/timeRange';
+
+// Shown while the first stats request is in flight, so the tiles don't pop in
+// with fabricated numbers.
+const SUMMARY_PLACEHOLDERS = [
+  { label: 'Total Events', value: '—', status: 'neutral' as const, trend: 'loading' },
+  { label: 'Error Rate', value: '—', status: 'neutral' as const, trend: 'loading' },
+  { label: 'Avg Load Time', value: '—', status: 'neutral' as const, trend: 'loading' },
+  { label: 'Slowest Page', value: '—', status: 'neutral' as const, trend: 'loading' },
+];
 
 const App: React.FC = () => {
-  // Auth State
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  // Auth State — a stored token is verified against the API before we render
+  // the app, so a revoked or expired session doesn't show a broken dashboard.
+  const [account, setAccount] = useState<{ user: User; tenant: Tenant } | null>(null);
+  const [bootstrapping, setBootstrapping] = useState(true);
   const [authMode, setAuthMode] = useState<'login' | 'signup'>('login');
 
   const [activePage, setActivePage] = useState<Page>('overview');
-  
+
   // Theme State
   const [theme, setTheme] = useState<'dark' | 'light'>('light');
 
@@ -33,14 +47,63 @@ const App: React.FC = () => {
   // Drag & Drop State
   const [draggedWidgetId, setDraggedWidgetId] = useState<string | null>(null);
 
-  const [apps, setApps] = useState<Application[]>(MOCK_APPS);
-  const [selectedApp, setSelectedApp] = useState<Application>(MOCK_APPS[0]);
-  const [showAppMenu, setShowAppMenu] = useState(false);
-  const [loadingApp, setLoadingApp] = useState(false);
-
   const [showAI, setShowAI] = useState(false);
   const [showAddWidgetModal, setShowAddWidgetModal] = useState(false);
   const [showCustomTimePicker, setShowCustomTimePicker] = useState(false);
+
+  useEffect(() => {
+    if (!session.token) {
+      setBootstrapping(false);
+      return;
+    }
+    me()
+      .then(setAccount)
+      .catch(() => session.clear())
+      .finally(() => setBootstrapping(false));
+  }, []);
+
+  const range = useMemo(
+    () => toDateRange(dashboardState.timeRange, dashboardState.customTimeRange),
+    [dashboardState.timeRange, dashboardState.customTimeRange]
+  );
+
+  const isAuthenticated = account !== null;
+
+  const stats = useApi(
+    () => (isAuthenticated ? dashboardStats(range) : Promise.resolve(null)),
+    [isAuthenticated, range.startDate, range.endDate]
+  );
+
+  const summaryMetrics = useMemo(() => {
+    const data = stats.data;
+    if (!data) return [];
+    return [
+      {
+        label: 'Total Events',
+        value: data.totalEvents.toLocaleString(),
+        status: 'neutral' as const,
+        trend: `${data.totalErrors.toLocaleString()} errors`,
+      },
+      {
+        label: 'Error Rate',
+        value: `${data.errorRate.toFixed(2)}%`,
+        status: data.errorRate > 5 ? ('warning' as const) : ('healthy' as const),
+        trend: data.errorRate > 5 ? 'above target' : 'within target',
+      },
+      {
+        label: 'Avg Load Time',
+        value: `${Math.round(data.avgLoadTime)}ms`,
+        status: data.avgLoadTime > 2500 ? ('warning' as const) : ('healthy' as const),
+        trend: data.avgLoadTime > 2500 ? 'slow' : 'good',
+      },
+      {
+        label: 'Slowest Page',
+        value: data.topSlowPages[0] ? `${Math.round(data.topSlowPages[0].avgLoadTime)}ms` : '—',
+        status: 'neutral' as const,
+        trend: data.topSlowPages[0] ? new URL(data.topSlowPages[0].url, 'http://x').pathname : 'no data',
+      },
+    ];
+  }, [stats.data]);
 
   // Apply theme class to document
   useEffect(() => {
@@ -53,8 +116,10 @@ const App: React.FC = () => {
 
   const toggleTheme = () => setTheme(t => t === 'dark' ? 'light' : 'dark');
 
-  const handleLogout = () => {
-    setIsAuthenticated(false);
+  const handleLogout = async () => {
+    await apiLogout();
+    setAccount(null);
+    setActivePage('overview');
     setAuthMode('login');
   };
 
@@ -121,32 +186,6 @@ const App: React.FC = () => {
     setShowAddWidgetModal(false);
   };
 
-  const handleAppChange = (app: Application) => {
-    if (app.id === selectedApp.id) return;
-    setShowAppMenu(false);
-    setLoadingApp(true);
-    // Simulate network delay for switching app context
-    setTimeout(() => {
-        setSelectedApp(app);
-        setLoadingApp(false);
-    }, 600);
-  };
-
-  const handleSelectAppFromOverview = (app: Application) => {
-    setSelectedApp(app);
-    setActivePage('dashboard');
-  };
-
-  const handleCreateApp = (newAppData: { name: string; framework: Application['framework'] }) => {
-    const newApp: Application = {
-      id: `app-${Date.now()}`,
-      name: newAppData.name,
-      framework: newAppData.framework,
-      health: 'healthy' // Default to healthy for new apps
-    };
-    setApps([...apps, newApp]);
-  };
-
   const handleTimeRangeChange = (range: TimeRange) => {
     if (range === 'custom') {
       setShowCustomTimePicker(!showCustomTimePicker);
@@ -165,6 +204,15 @@ const App: React.FC = () => {
     setShowCustomTimePicker(false);
   };
 
+  if (bootstrapping) {
+    return (
+      <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex flex-col items-center justify-center gap-3">
+        <Icons.Refresh className="animate-spin text-primary-500" size={28} />
+        <p className="text-slate-500 text-sm">Restoring your session…</p>
+      </div>
+    );
+  }
+
   if (!isAuthenticated) {
     return (
       <>
@@ -177,10 +225,10 @@ const App: React.FC = () => {
              {theme === 'dark' ? <Icons.Sun size={18} /> : <Icons.Moon size={18} />}
           </button>
         </div>
-        <AuthPage 
-          mode={authMode} 
-          onAuth={() => setIsAuthenticated(true)} 
-          onSwitchMode={setAuthMode} 
+        <AuthPage
+          mode={authMode}
+          onAuth={(payload: AuthPayload) => setAccount({ user: payload.user, tenant: payload.tenant })}
+          onSwitchMode={setAuthMode}
         />
       </>
     );
@@ -192,71 +240,27 @@ const App: React.FC = () => {
       <header className="h-16 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 px-6 flex items-center justify-between sticky top-0 z-40 shadow-sm transition-colors duration-200">
         <div className="flex items-center gap-8">
           <div className="flex items-center gap-4">
-             <div className="flex items-center gap-2 text-primary-600 dark:text-primary-500 cursor-pointer" onClick={() => setActivePage('overview')}>
-                <Icons.Activity size={24} strokeWidth={2.5} />
+             <div className="flex items-center gap-2 cursor-pointer" onClick={() => setActivePage('overview')}>
+                <img src="/logo.png" alt="ObsPro" className="h-7 w-7 object-contain" />
                 <span className="text-slate-900 dark:text-white font-bold text-lg tracking-tight">ObsPro</span>
              </div>
              
-             {/* Divider & App Selector - Hidden on Overview */}
+             {/* Divider & tenant identity - Hidden on Overview */}
              {activePage !== 'overview' && (
                <>
                  <div className="h-6 w-px bg-slate-200 dark:bg-slate-800"></div>
 
-                 {/* App Selector */}
-                 <div className="relative">
-                    <button 
-                        onClick={() => setShowAppMenu(!showAppMenu)}
-                        className="flex items-center gap-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded px-2 py-1.5 transition-colors group"
-                    >
-                        <div className="w-5 h-5 rounded bg-gradient-to-br from-primary-500 to-teal-500 flex items-center justify-center text-[10px] font-bold text-white uppercase">
-                            {selectedApp.name.substring(0,2)}
-                        </div>
-                        <span className="text-sm font-medium text-slate-700 dark:text-slate-200 group-hover:text-slate-900 dark:group-hover:text-white">{selectedApp.name}</span>
-                        <Icons.ChevronDown size={14} className="text-slate-400 dark:text-slate-500 group-hover:text-slate-600 dark:group-hover:text-slate-300" />
-                    </button>
-
-                    {showAppMenu && (
-                        <>
-                            <div className="fixed inset-0 z-10" onClick={() => setShowAppMenu(false)}></div>
-                            <div className="absolute left-0 top-full mt-2 w-64 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg shadow-xl z-20 py-1 overflow-hidden animate-fade-in">
-                                <div className="px-4 py-2 border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-850">
-                                    <span className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">Select Application</span>
-                                </div>
-                                {apps.map(app => (
-                                    <button
-                                        key={app.id}
-                                        onClick={() => handleAppChange(app)}
-                                        className={`w-full text-left px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center justify-between group ${selectedApp.id === app.id ? 'bg-slate-100 dark:bg-slate-800/50' : ''}`}
-                                    >
-                                        <div className="flex items-center gap-3">
-                                            <div className={`w-8 h-8 rounded flex items-center justify-center text-xs font-bold uppercase transition-colors
-                                                ${app.framework === 'next' ? 'bg-black text-white' : 
-                                                  app.framework === 'react' ? 'bg-blue-100 dark:bg-blue-900/50 text-blue-600 dark:text-blue-400' : 
-                                                  'bg-green-100 dark:bg-green-900/50 text-green-600 dark:text-green-400'
-                                                }
-                                            `}>
-                                                {app.framework === 'next' ? 'N' : app.framework === 'react' ? 'R' : 'js'}
-                                            </div>
-                                            <div>
-                                                <div className={`text-sm font-medium ${selectedApp.id === app.id ? 'text-slate-900 dark:text-white' : 'text-slate-600 dark:text-slate-300 group-hover:text-slate-900 dark:group-hover:text-white'}`}>{app.name}</div>
-                                                <div className="text-xs text-slate-500 capitalize">{app.framework} • {app.health}</div>
-                                            </div>
-                                        </div>
-                                        {selectedApp.id === app.id && <Icons.Check size={16} className="text-primary-500" />}
-                                    </button>
-                                ))}
-                                <div className="border-t border-slate-200 dark:border-slate-800 p-2">
-                                    <button 
-                                      onClick={() => { setShowAppMenu(false); setActivePage('overview'); }}
-                                      className="w-full py-2 text-xs font-medium text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 rounded flex items-center justify-center gap-2"
-                                    >
-                                        <Icons.Plus size={12} /> Create New App
-                                    </button>
-                                </div>
-                            </div>
-                        </>
-                    )}
-                 </div>
+                 <button
+                    onClick={() => setActivePage('overview')}
+                    className="flex items-center gap-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded px-2 py-1.5 transition-colors group"
+                    title="Back to projects & API keys"
+                 >
+                    <div className="w-5 h-5 rounded bg-gradient-to-br from-primary-500 to-teal-500 flex items-center justify-center text-[10px] font-bold text-white uppercase">
+                        {account!.tenant.name.substring(0, 2)}
+                    </div>
+                    <span className="text-sm font-medium text-slate-700 dark:text-slate-200 group-hover:text-slate-900 dark:group-hover:text-white">{account!.tenant.name}</span>
+                    <span className="text-xs text-slate-400 dark:text-slate-500">{account!.tenant.plan}</span>
+                 </button>
                </>
              )}
           </div>
@@ -377,19 +381,10 @@ const App: React.FC = () => {
         <div className="max-w-[1600px] mx-auto w-full">
           
           {activePage === 'overview' ? (
-             <OverviewPage 
-               apps={apps}
-               onSelectApp={handleSelectAppFromOverview} 
-               onCreateApp={handleCreateApp}
-             />
+             <OverviewPage onOpenDashboards={() => setActivePage('dashboard')} />
           ) : (
             <>
-              {loadingApp ? (
-                  <div className="flex flex-col items-center justify-center py-40 animate-fade-in">
-                      <Icons.Refresh className="animate-spin text-primary-500 mb-4" size={32} />
-                      <p className="text-slate-400 text-sm">Loading data for <span className="text-slate-900 dark:text-white font-medium">{selectedApp.name}</span>...</p>
-                  </div>
-              ) : (
+              {(
                 <div className="p-6">
                   {/* Dashboard View */}
                   {activePage === 'dashboard' && (
@@ -398,7 +393,7 @@ const App: React.FC = () => {
                         <div>
                           <div className="flex items-center gap-2 mb-1">
                               <h1 className="text-2xl font-bold text-slate-900 dark:text-white">Frontend Overview</h1>
-                              <span className="text-xs px-2 py-0.5 rounded-full bg-slate-200 dark:bg-slate-800 text-slate-600 dark:text-slate-400 border border-slate-300 dark:border-slate-700">{selectedApp.name}</span>
+                              <span className="text-xs px-2 py-0.5 rounded-full bg-slate-200 dark:bg-slate-800 text-slate-600 dark:text-slate-400 border border-slate-300 dark:border-slate-700">{account!.tenant.name}</span>
                           </div>
                           <p className="text-slate-500 dark:text-slate-400 text-sm">Real-time visibility into user experience and system health.</p>
                         </div>
@@ -434,9 +429,16 @@ const App: React.FC = () => {
                         </div>
                       </div>
 
-                      {/* Summary Section */}
+                      {/* Summary Section — live tenant totals for the selected window */}
+                      {stats.error && (
+                        <div className="mb-6 p-4 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-900/50 text-sm text-red-700 dark:text-red-300 flex items-center gap-2">
+                          <Icons.AlertTriangle size={16} />
+                          <span>{stats.error}</span>
+                          <button onClick={stats.refetch} className="ml-auto underline">Retry</button>
+                        </div>
+                      )}
                       <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
-                        {MOCK_SUMMARY_METRICS.map((m) => (
+                        {(stats.loading && !stats.data ? SUMMARY_PLACEHOLDERS : summaryMetrics).map((m) => (
                           <div key={m.label} className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 rounded-lg flex items-center justify-between shadow-sm">
                             <div>
                               <div className="text-slate-500 dark:text-slate-400 text-xs uppercase font-bold tracking-wider">{m.label}</div>
@@ -460,10 +462,8 @@ const App: React.FC = () => {
                             config={widget} 
                             isEditMode={dashboardState.isEditMode}
                             isDragging={draggedWidgetId === widget.id}
-                            appId={selectedApp.id}
                             timeRange={dashboardState.timeRange}
-                            environment={dashboardState.environment}
-                            customTimeRange={dashboardState.customTimeRange}
+                            range={range}
                             onRemove={removeWidget}
                             onResize={resizeWidget}
                             onDragStart={handleDragStart}
@@ -487,8 +487,8 @@ const App: React.FC = () => {
                   )}
 
                   {/* Sub Pages */}
-                  {activePage === 'issues' && <IssuesPage environment={dashboardState.environment} theme={theme} />}
-                  {activePage === 'performance' && <PerformancePage environment={dashboardState.environment} theme={theme} />}
+                  {activePage === 'issues' && <IssuesPage timeRange={dashboardState.timeRange} range={range} theme={theme} />}
+                  {activePage === 'performance' && <PerformancePage timeRange={dashboardState.timeRange} range={range} theme={theme} />}
                   {activePage === 'replays' && <ReplaysPage theme={theme} />}
                 </div>
               )}
@@ -498,11 +498,24 @@ const App: React.FC = () => {
         </div>
       </main>
 
-      {/* AI Panel */}
+      {/* AI Panel — analyses the metrics actually on screen */}
       {showAI && (
-        <AIAnalysisPanel 
-          dashboardState={dashboardState} 
-          onClose={() => setShowAI(false)} 
+        <AIAnalysisPanel
+          dashboardState={dashboardState}
+          metricsSummary={JSON.stringify(
+            stats.data
+              ? {
+                  window: { start: range.startDate, end: range.endDate },
+                  totalEvents: stats.data.totalEvents,
+                  totalErrors: stats.data.totalErrors,
+                  errorRatePercent: stats.data.errorRate,
+                  avgLoadTimeMs: stats.data.avgLoadTime,
+                  topErrors: stats.data.topErrors.map((e) => ({ message: e.message, count: e.count })),
+                  slowestPages: stats.data.topSlowPages.map((p) => ({ url: p.url, avgLoadTimeMs: p.avgLoadTime })),
+                }
+              : { note: 'No metrics loaded yet' }
+          )}
+          onClose={() => setShowAI(false)}
         />
       )}
 

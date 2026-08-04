@@ -1,4 +1,4 @@
-import { WidgetConfig, ChartType, MetricType, Issue, WebVital, RoutePerformance, ReplaySession, Application, TimeRange, Environment, CustomTimeRange } from './types';
+import { WidgetConfig, ChartType, MetricType, ReplaySession, Issue, WebVital, RoutePerformance, TimeRange, Environment, CustomTimeRange } from './types';
 
 export const INITIAL_WIDGETS: WidgetConfig[] = [
   { id: '1', title: 'Total User Sessions', type: ChartType.Area, metric: MetricType.UserSessions, w: 2, h: 1 },
@@ -8,19 +8,6 @@ export const INITIAL_WIDGETS: WidgetConfig[] = [
   { id: '5', title: 'API Latency P95 (ms)', type: ChartType.Line, metric: MetricType.ApiLatency, w: 2, h: 1 },
   { id: '6', title: 'Browser Distribution', type: ChartType.Pie, metric: MetricType.JsHeap, w: 1, h: 1 }, 
   { id: '7', title: 'Slowest Routes', type: ChartType.Bar, metric: MetricType.PageLoad, w: 3, h: 1 },
-];
-
-export const MOCK_APPS: Application[] = [
-  { id: 'app-1', name: 'E-commerce Storefront', framework: 'next', health: 'healthy' },
-  { id: 'app-2', name: 'Merchant Dashboard', framework: 'react', health: 'warning' },
-  { id: 'app-3', name: 'Payment Service', framework: 'node', health: 'healthy' },
-];
-
-export const MOCK_SUMMARY_METRICS = [
-  { label: 'System Health', value: '98%', status: 'healthy', trend: '+1%' },
-  { label: 'Active Sessions', value: '2,420', status: 'neutral', trend: '+12%' },
-  { label: 'Avg Response Time', value: '145ms', status: 'healthy', trend: '-15ms' },
-  { label: 'Error Rate', value: '0.42%', status: 'warning', trend: '+0.1%' },
 ];
 
 export const MOCK_COLORS = {

@@ -1,0 +1,26 @@
+{
+  "name": "@web-monitor/sdk",
+  "version": "1.0.0",
+  "description": "Browser SDK for the web page monitor: errors, API failures, page performance, business flows and custom events.",
+  "type": "module",
+  "main": "monitor.js",
+  "module": "monitor.js",
+  "exports": {
+    ".": "./monitor.js"
+  },
+  "files": [
+    "monitor.js"
+  ],
+  "sideEffects": [
+    "monitor.js"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "jsdom": "^25.0.1",
+    "vitest": "^3.2.7"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  }
+}

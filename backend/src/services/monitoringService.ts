@@ -62,36 +62,72 @@ function customEventData(tenantId: string, input: IngestCustomEventInput): Prism
   }
 }
 
+export const BUCKET_MS = 60 * 60 * 1000
+const MAX_CLOCK_SKEW_MS = 24 * 60 * 60 * 1000
+
+/** Floors a timestamp to the hour its occurrences are counted in. */
+export function bucketStartFor(timestamp: number): Date {
+  return new Date(Math.floor(timestamp / BUCKET_MS) * BUCKET_MS)
+}
+
+/**
+ * Event times come from the browser, where the clock can be wrong by years.
+ * Anything more than a day away from server time is treated as unusable so a
+ * single bad clock can't park an issue in 1970 or the far future.
+ */
+export function resolveEventTime(timestamp: number, now = Date.now()): Date {
+  return Math.abs(now - timestamp) > MAX_CLOCK_SKEW_MS ? new Date(now) : new Date(timestamp)
+}
+
 async function upsertError(
   tenantId: string,
   input: IngestErrorInput,
   errorHash: string,
   occurrences: number
 ): Promise<void> {
-  const updated = await prisma.errorLog.updateMany({
-    where: { tenantId, errorHash },
-    data: { occurrenceCount: { increment: occurrences } },
+  const seenAt = resolveEventTime(input.timestamp)
+
+  // (tenantId, errorHash) is unique, so this is a single atomic statement —
+  // concurrent reports of the same error increment instead of racing to insert.
+  await prisma.errorLog.upsert({
+    where: { tenantId_errorHash: { tenantId, errorHash } },
+    create: {
+      tenantId,
+      type: input.type,
+      message: input.message,
+      stackTrace: input.stack ?? null,
+      source: input.source ?? null,
+      lineNumber: input.lineNo ?? null,
+      columnNumber: input.colNo ?? null,
+      url: input.url,
+      userAgent: input.userAgent,
+      timestamp: BigInt(input.timestamp),
+      errorHash,
+      occurrenceCount: occurrences,
+      lastSeenAt: seenAt,
+      metadata: (input.metadata ?? {}) as Prisma.InputJsonValue,
+    },
+    update: {
+      occurrenceCount: { increment: occurrences },
+      lastSeenAt: seenAt,
+    },
   })
 
-  if (updated.count === 0) {
-    await prisma.errorLog.create({
-      data: {
-        tenantId,
-        type: input.type,
-        message: input.message,
-        stackTrace: input.stack ?? null,
-        source: input.source ?? null,
-        lineNumber: input.lineNo ?? null,
-        columnNumber: input.colNo ?? null,
-        url: input.url,
-        userAgent: input.userAgent,
-        timestamp: BigInt(input.timestamp),
-        errorHash,
-        occurrenceCount: occurrences,
-        metadata: (input.metadata ?? {}) as Prisma.InputJsonValue,
-      },
-    })
-  }
+  // An error someone marked Resolved that is happening again is a regression,
+  // not a fresh issue. Separate statement so it only touches resolved rows.
+  await prisma.errorLog.updateMany({
+    where: { tenantId, errorHash, status: 'Resolved' },
+    data: { status: 'Regressed' },
+  })
+
+  // Hourly counter: the ErrorLog row collapses every occurrence into one
+  // record, so without this an issue has no trend line.
+  const bucketStart = bucketStartFor(seenAt.getTime())
+  await prisma.errorBucket.upsert({
+    where: { tenantId_errorHash_bucketStart: { tenantId, errorHash, bucketStart } },
+    create: { tenantId, errorHash, bucketStart, count: occurrences },
+    update: { count: { increment: occurrences } },
+  })
 }
 
 export async function ingestError(tenantId: string, input: IngestErrorInput): Promise<void> {

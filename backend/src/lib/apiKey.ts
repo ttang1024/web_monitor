@@ -15,6 +15,19 @@ export interface ResolvedApiKey {
   tenantId: string
 }
 
+/**
+ * Drops a key from the resolve cache. Revoking a key has to call this or the
+ * key keeps working for up to CACHE_TTL_MS after it was switched off.
+ */
+export function invalidateApiKey(apiKey: string): void {
+  cache.delete(apiKey)
+}
+
+/** Test seam: empties the cache. */
+export function clearApiKeyCache(): void {
+  cache.clear()
+}
+
 export async function resolveApiKey(apiKey: string): Promise<ResolvedApiKey> {
   const cached = cache.get(apiKey)
   if (cached && cached.expiresAt > Date.now()) {

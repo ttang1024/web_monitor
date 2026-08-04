@@ -89,6 +89,11 @@ export interface SaveLayoutInput {
   configuration: unknown
 }
 
+export interface CreateApiKeyInput {
+  name: string
+  environment?: string
+}
+
 export interface GraphQLContext {
   auth?: {
     userId: string
@@ -97,4 +102,6 @@ export interface GraphQLContext {
     role: string
   }
   apiKeyHeader?: string
+  /** Caller address, used to key auth rate limiting. */
+  ip?: string
 }

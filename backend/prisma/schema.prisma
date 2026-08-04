@@ -18,6 +18,14 @@ enum UserRole {
   Admin
 }
 
+enum ErrorStatus {
+  Unresolved
+  Resolved
+  Ignored
+  // A resolved error that started happening again.
+  Regressed
+}
+
 model Tenant {
   id                 String           @id @default(uuid()) @db.Char(36)
   name               String
@@ -35,6 +43,7 @@ model Tenant {
   users             User[]
   apiKeys           ApiKey[]
   errorLogs         ErrorLog[]
+  errorBuckets      ErrorBucket[]
   performanceMetrics PerformanceMetric[]
   apiErrors         ApiError[]
   customEvents      CustomEvent[]
@@ -56,9 +65,24 @@ model User {
 
   tenant           Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   dashboardLayouts DashboardLayout[]
+  refreshTokens    RefreshToken[]
 
   @@index([email])
   @@index([tenantId])
+}
+
+// Refresh tokens are stored hashed: a leaked table row cannot be replayed as a token.
+model RefreshToken {
+  id        String    @id @default(uuid()) @db.Char(36)
+  userId    String    @db.Char(36)
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
 }
 
 model ApiKey {
@@ -92,15 +116,33 @@ model ErrorLog {
   userAgent       String    @db.Text
   timestamp       BigInt
   errorHash       String
-  occurrenceCount Int       @default(1)
+  occurrenceCount Int         @default(1)
+  status          ErrorStatus @default(Unresolved)
+  lastSeenAt      DateTime    @default(now())
   metadata        Json?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime? @updatedAt
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime?   @updatedAt
 
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
+  @@unique([tenantId, errorHash])
   @@index([tenantId, createdAt])
-  @@index([tenantId, errorHash])
+  @@index([tenantId, status, lastSeenAt])
+}
+
+// Errors collapse into one ErrorLog row per hash, which loses their shape over time.
+// This keeps an hourly counter per hash so each issue still has a real trend line.
+model ErrorBucket {
+  id          String   @id @default(uuid()) @db.Char(36)
+  tenantId    String   @db.Char(36)
+  errorHash   String
+  bucketStart DateTime
+  count       Int      @default(0)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, errorHash, bucketStart])
+  @@index([tenantId, bucketStart])
 }
 
 model PerformanceMetric {
