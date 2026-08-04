@@ -7,6 +7,7 @@ import { CustomTimeRangePicker } from './components/Dashboard/CustomTimeRangeMod
 import { IssuesPage } from './components/Pages/IssuesPage';
 import { PerformancePage } from './components/Pages/PerformancePage';
 import { ReplaysPage } from './components/Pages/ReplaysPage';
+import { AlertsPage } from './components/Pages/AlertsPage';
 import { OverviewPage } from './components/Pages/OverviewPage';
 import { AuthPage } from './components/Pages/AuthPage';
 import { DashboardState, WidgetConfig, TimeRange, Environment, ChartType, MetricType, Page, CustomTimeRange } from './types';
@@ -268,7 +269,7 @@ const App: React.FC = () => {
           {/* Navigation - Hidden on Overview */}
           {activePage !== 'overview' && (
             <nav className="hidden md:flex items-center gap-1">
-              {['Dashboard', 'Issues', 'Performance', 'Replays'].map((item) => {
+              {['Dashboard', 'Issues', 'Performance', 'Replays', 'Alerts'].map((item) => {
                 const pageKey = item.toLowerCase() as Page;
                 const isActive = activePage === pageKey;
                 return (
@@ -490,6 +491,7 @@ const App: React.FC = () => {
                   {activePage === 'issues' && <IssuesPage timeRange={dashboardState.timeRange} range={range} theme={theme} />}
                   {activePage === 'performance' && <PerformancePage timeRange={dashboardState.timeRange} range={range} theme={theme} />}
                   {activePage === 'replays' && <ReplaysPage theme={theme} />}
+                  {activePage === 'alerts' && <AlertsPage />}
                 </div>
               )}
             </>

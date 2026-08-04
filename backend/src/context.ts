@@ -26,5 +26,11 @@ export function buildContext(headers: IncomingHttpHeaders, ip?: string): GraphQL
     context.apiKeyHeader = apiKeyHeader
   }
 
+  // Browsers set Origin on cross-origin requests and refuse to let page script
+  // forge it, which is what makes it usable as an API key allowlist check.
+  if (typeof headers.origin === 'string') {
+    context.origin = headers.origin
+  }
+
   return context
 }

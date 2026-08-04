@@ -11,7 +11,9 @@ import { expressMiddleware } from '@as-integrations/express5'
 import type { GraphQLFormattedError } from 'graphql'
 import { resolvers } from './graphql/resolvers/index.js'
 import { buildContext } from './context.js'
+import { depthLimit } from './lib/queryDepth.js'
 import { prisma } from './prisma.js'
+import { startScheduler } from './scheduler.js'
 import type { GraphQLContext } from './types.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -35,8 +37,24 @@ app.use(
 )
 app.use(express.json({ limit: '2mb' }))
 
+// Liveness: the process is up and the event loop is turning. Deliberately does
+// not touch the database — a restart cannot fix a database outage, and an
+// orchestrator that kills the pod for one only makes the outage worse.
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok' })
+  res.json({ status: 'ok', uptimeSeconds: Math.round(process.uptime()) })
+})
+
+// Readiness: can this instance actually serve a request? Every resolver needs
+// the database, so an instance that cannot reach it should be taken out of the
+// load balancer rather than left to fail requests.
+app.get('/ready', async (_req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`
+    res.json({ status: 'ready' })
+  } catch (error) {
+    console.error('Readiness check failed:', error instanceof Error ? error.message : error)
+    res.status(503).json({ status: 'unavailable', reason: 'database unreachable' })
+  }
 })
 
 const apollo = new ApolloServer<GraphQLContext>({
@@ -44,6 +62,9 @@ const apollo = new ApolloServer<GraphQLContext>({
   resolvers,
   // Don't hand an attacker a map of the schema in production.
   introspection: !env.isProduction,
+  // Runs during validation, so an abusive query is rejected before a single
+  // resolver — and a single database query — is reached.
+  validationRules: [depthLimit(env.MAX_QUERY_DEPTH)],
   formatError: (formattedError: GraphQLFormattedError, error: unknown): GraphQLFormattedError => {
     const original = unwrapResolverError(error)
     const code = original instanceof Error ? (original as { code?: string }).code : undefined
@@ -77,6 +98,10 @@ const server = app.listen(env.PORT, () => {
   console.log(`GraphQL API ready at http://localhost:${env.PORT}/graphql`)
 })
 
+// Alert evaluation and the retention sweep. Started after the server is
+// listening so a slow first sweep can't delay readiness.
+const scheduler = startScheduler()
+
 // Stop accepting connections, drain in-flight requests, then close the pool.
 // Without this a rolling deploy can kill a request mid-write.
 async function shutdown(signal: string): Promise<void> {
@@ -87,6 +112,10 @@ async function shutdown(signal: string): Promise<void> {
     process.exit(1)
   }, 10_000)
   forceExit.unref()
+
+  // Stop scheduling new sweeps first: one starting mid-shutdown would issue
+  // queries against a pool that is about to close.
+  scheduler.stop()
 
   try {
     await new Promise<void>((resolve, reject) => {

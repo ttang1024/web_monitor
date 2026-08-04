@@ -21,8 +21,8 @@ export const AIAnalysisPanel: React.FC<Props> = ({ dashboardState, metricsSummar
     try {
       const result = await analyzeDashboard(dashboardState, metricsSummary);
       setAnalysis(result);
-    } catch (err: any) {
-      setError(err.message || "Failed to analyze data.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to analyze data.");
     } finally {
       setLoading(false);
     }

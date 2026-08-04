@@ -227,6 +227,10 @@ class MonitoringSDK {
 
 	instrumentXhr() {
 		if (!window.XMLHttpRequest) return
+		// The patched methods below must stay `function`s so `this` is the
+		// XMLHttpRequest being sent — which is exactly why the SDK instance has
+		// to be reached through a variable instead.
+		// eslint-disable-next-line @typescript-eslint/no-this-alias
 		const sdk = this
 		const proto = XMLHttpRequest.prototype
 		this.originalXhrOpen = proto.open

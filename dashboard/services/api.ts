@@ -127,7 +127,61 @@ export interface ApiKey {
   environment: string;
   isActive: boolean;
   lastUsedAt: string | null;
+  /** Origins permitted to ingest with this key. Empty means any origin. */
+  allowedOrigins: string[];
   createdAt: string;
+}
+
+export type AlertCondition = 'NewIssue' | 'ErrorSpike' | 'ErrorRate' | 'SlowPageLoad';
+export type AlertSeverity = 'Info' | 'Warning' | 'Critical';
+
+export interface AlertRule {
+  id: string;
+  name: string;
+  condition: AlertCondition;
+  threshold: number;
+  windowMinutes: number;
+  severity: AlertSeverity;
+  isEnabled: boolean;
+  cooldownMinutes: number;
+  lastTriggeredAt: string | null;
+  webhookUrl: string | null;
+  createdAt: string;
+}
+
+export interface AlertNotification {
+  id: string;
+  alertRuleId: string;
+  ruleName: string;
+  title: string;
+  body: string;
+  severity: AlertSeverity;
+  observedValue: number;
+  threshold: number;
+  errorHash: string | null;
+  isRead: boolean;
+  deliveredAt: string | null;
+  deliveryError: string | null;
+  createdAt: string;
+}
+
+export interface AlertNotificationPage {
+  total: number;
+  page: number;
+  pageSize: number;
+  unread: number;
+  data: AlertNotification[];
+}
+
+export interface AlertRuleInput {
+  name: string;
+  condition: AlertCondition;
+  threshold: number;
+  windowMinutes: number;
+  severity: AlertSeverity;
+  cooldownMinutes: number;
+  webhookUrl?: string | null;
+  isEnabled?: boolean;
 }
 
 export type ErrorStatus = 'Unresolved' | 'Resolved' | 'Ignored' | 'Regressed';
@@ -239,6 +293,8 @@ const REFRESH_MUTATION = `mutation Refresh($refreshToken: String!) { refreshSess
 
 const ERROR_FIELDS = `id type message stackTrace source lineNumber columnNumber url userAgent timestamp errorHash occurrenceCount status lastSeenAt metadata createdAt`;
 
+const API_KEY_FIELDS = `id name key environment isActive lastUsedAt allowedOrigins createdAt`;
+
 export async function login(email: string, password: string): Promise<AuthPayload> {
   const data = await post<{ login: AuthPayload }>(
     `mutation Login($input: LoginInput!) { login(input: $input) { ${AUTH_FIELDS} } }`,
@@ -285,14 +341,14 @@ export async function me(): Promise<{ user: User; tenant: Tenant }> {
 
 export async function listApiKeys(): Promise<ApiKey[]> {
   const data = await authed<{ apiKeys: ApiKey[] }>(
-    `query ApiKeys { apiKeys { id name key environment isActive lastUsedAt createdAt } }`
+    `query ApiKeys { apiKeys { ${API_KEY_FIELDS} } }`
   );
   return data.apiKeys;
 }
 
 export async function createApiKey(name: string, environment: string): Promise<ApiKey> {
   const data = await authed<{ createApiKey: ApiKey }>(
-    `mutation CreateApiKey($input: CreateApiKeyInput!) { createApiKey(input: $input) { id name key environment isActive lastUsedAt createdAt } }`,
+    `mutation CreateApiKey($input: CreateApiKeyInput!) { createApiKey(input: $input) { ${API_KEY_FIELDS} } }`,
     { input: { name, environment } }
   );
   return data.createApiKey;
@@ -300,10 +356,81 @@ export async function createApiKey(name: string, environment: string): Promise<A
 
 export async function revokeApiKey(id: string): Promise<ApiKey> {
   const data = await authed<{ revokeApiKey: ApiKey }>(
-    `mutation RevokeApiKey($id: ID!) { revokeApiKey(id: $id) { id name key environment isActive lastUsedAt createdAt } }`,
+    `mutation RevokeApiKey($id: ID!) { revokeApiKey(id: $id) { ${API_KEY_FIELDS} } }`,
     { id }
   );
   return data.revokeApiKey;
+}
+
+export async function setApiKeyAllowedOrigins(id: string, origins: string[]): Promise<ApiKey> {
+  const data = await authed<{ setApiKeyAllowedOrigins: ApiKey }>(
+    `mutation SetOrigins($id: ID!, $origins: [String!]!) {
+      setApiKeyAllowedOrigins(id: $id, origins: $origins) { ${API_KEY_FIELDS} }
+    }`,
+    { id, origins }
+  );
+  return data.setApiKeyAllowedOrigins;
+}
+
+// --- Alerts -----------------------------------------------------------------
+
+const ALERT_RULE_FIELDS = `id name condition threshold windowMinutes severity isEnabled cooldownMinutes lastTriggeredAt webhookUrl createdAt`;
+
+const ALERT_NOTIFICATION_FIELDS = `id alertRuleId ruleName title body severity observedValue threshold errorHash isRead deliveredAt deliveryError createdAt`;
+
+export async function listAlertRules(): Promise<AlertRule[]> {
+  const data = await authed<{ alertRules: AlertRule[] }>(
+    `query AlertRules { alertRules { ${ALERT_RULE_FIELDS} } }`
+  );
+  return data.alertRules;
+}
+
+export async function createAlertRule(input: AlertRuleInput): Promise<AlertRule> {
+  const data = await authed<{ createAlertRule: AlertRule }>(
+    `mutation CreateAlertRule($input: AlertRuleInput!) { createAlertRule(input: $input) { ${ALERT_RULE_FIELDS} } }`,
+    { input }
+  );
+  return data.createAlertRule;
+}
+
+export async function updateAlertRule(id: string, input: Partial<AlertRuleInput>): Promise<AlertRule> {
+  const data = await authed<{ updateAlertRule: AlertRule }>(
+    `mutation UpdateAlertRule($id: ID!, $input: UpdateAlertRuleInput!) {
+      updateAlertRule(id: $id, input: $input) { ${ALERT_RULE_FIELDS} }
+    }`,
+    { id, input }
+  );
+  return data.updateAlertRule;
+}
+
+export async function deleteAlertRule(id: string): Promise<boolean> {
+  const data = await authed<{ deleteAlertRule: boolean }>(
+    `mutation DeleteAlertRule($id: ID!) { deleteAlertRule(id: $id) }`,
+    { id }
+  );
+  return data.deleteAlertRule;
+}
+
+export async function listAlertNotifications(
+  params: { page?: number; pageSize?: number; unreadOnly?: boolean } = {}
+): Promise<AlertNotificationPage> {
+  const data = await authed<{ alertNotifications: AlertNotificationPage }>(
+    `query AlertNotifications($page: Int, $pageSize: Int, $unreadOnly: Boolean) {
+      alertNotifications(page: $page, pageSize: $pageSize, unreadOnly: $unreadOnly) {
+        total page pageSize unread data { ${ALERT_NOTIFICATION_FIELDS} }
+      }
+    }`,
+    params
+  );
+  return data.alertNotifications;
+}
+
+export async function markAlertNotificationsRead(ids?: string[]): Promise<number> {
+  const data = await authed<{ markAlertNotificationsRead: number }>(
+    `mutation MarkRead($ids: [ID!]) { markAlertNotificationsRead(ids: $ids) }`,
+    { ids }
+  );
+  return data.markAlertNotificationsRead;
 }
 
 export async function dashboardStats(range: DateRange = {}): Promise<DashboardStats> {

@@ -15,6 +15,7 @@ A monitoring SaaS platform: a browser SDK, a GraphQL ingestion API, and a dashbo
 ![Vite](https://img.shields.io/badge/Vite-6-646CFF?logo=vite&logoColor=white)
 ![Recharts](https://img.shields.io/badge/Recharts-3-FF6384?logo=chartdotjs&logoColor=white)
 ![Gemini](https://img.shields.io/badge/Google%20Gemini-1.33-8E75B2?logo=googlegemini&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green)
 
 ![Dashboard walkthrough — Dashboard, Issues, Performance, Replays](demos/demo.gif)
 
@@ -24,6 +25,22 @@ A monitoring SaaS platform: a browser SDK, a GraphQL ingestion API, and a dashbo
 | `backend/`   | Apollo Server + Express API on Prisma/MySQL, single `/graphql` |
 | `dashboard/` | React + Vite dashboard, live off the GraphQL API                |
 | `examples/`  | Runnable demos per monitoring layer — see `examples/README.md` |
+
+`sdk/`, `backend/` and `dashboard/` each install their own dependencies;
+`examples/` is plain source you copy from. The root holds only repository-wide
+pieces: `docker-compose.yml` for the full stack, and the ESLint and Prettier
+config shared by all three (`npm install` at the root is tooling only — it does
+not build or run anything).
+
+## Running the whole stack
+
+```bash
+cp .env.example .env          # set JWT_SECRET (32+ chars) at minimum
+docker compose up --build     # dashboard :8080, API :4000, MySQL
+```
+
+The API container applies migrations on start. `backend/docker-compose.yml` is
+the development counterpart — MySQL alone, so the API can run from source.
 
 ## Backend
 
@@ -38,13 +55,26 @@ npm run dev
 
 `src/lib/env.ts` validates every variable at boot, so misconfiguration fails
 fast — `JWT_SECRET` must be at least 32 characters. Sessions are tuned with
-`ACCESS_TOKEN_TTL` (default `24h`) and `REFRESH_TOKEN_TTL_DAYS` (default `30`).
+`ACCESS_TOKEN_TTL` (default `24h`) and `REFRESH_TOKEN_TTL_DAYS` (default `30`);
+ingest volume with `INGEST_EVENTS_PER_MINUTE` (default `6000`, per key), query
+shape with `MAX_QUERY_DEPTH` (default `12`), and background work with
+`RETENTION_DAYS` (default `90`), `ALERTS_ENABLED` and `ALERT_INTERVAL_SECONDS`.
 
-GraphQL at http://localhost:4000/graphql, health at http://localhost:4000/health.
+GraphQL at http://localhost:4000/graphql. Two probes: `/health` is liveness and
+never touches the database (a restart cannot fix an outage), `/ready` pings it
+and returns 503 when it is unreachable.
+
 Also: `npm run build`, `npm start`, `npm run db:studio`, `npm test`, `npm run typecheck`.
 
 `register` creates a tenant with a default API key — read keys via the `apiKeys`
 query or the dashboard's Projects page. The SDK sends it as `X-API-Key`.
+
+An ingest key is readable by anyone who views the page source it ships in, so a
+key can be pinned to the origins it may report from, on the Projects page or via
+`setApiKeyAllowedOrigins`. A key with an allowlist rejects every other origin —
+including a request with no `Origin` header at all, which is what a key replayed
+outside a browser looks like. A key with an empty allowlist accepts any origin,
+which is how keys are created.
 
 ## Dashboard
 
@@ -56,8 +86,9 @@ npm run dev                  # http://localhost:3000
 ```
 
 Sign-up lands on **Projects**, where each project is an API key with a copyable
-install snippet; **Dashboards** opens the Dashboard / Issues / Performance /
-Replays views. Replays is sample data, labeled as such in the UI; the rest is live.
+install snippet and its origin allowlist; **Dashboards** opens the Dashboard /
+Issues / Performance / Replays / Alerts views. Replays is sample data, labeled as
+such in the UI; the rest is live.
 
 ## SDK
 
@@ -113,16 +144,37 @@ Failed flushes are re-queued and retried with exponential backoff; batches the
 API rejects outright (bad key, invalid payload) are dropped rather than retried
 forever.
 
+## Alerts
+
+Rules are evaluated on a timer against the window ending now — never on the
+ingest path, so a burst of 500 errors costs one evaluation rather than 500.
+Four conditions:
+
+| Condition      | Fires when                                          | Threshold unit |
+| -------------- | --------------------------------------------------- | -------------- |
+| `NewIssue`     | An error hash is seen for the first time            | — |
+| `ErrorSpike`   | Occurrences in the window exceed the threshold      | occurrences |
+| `ErrorRate`    | Errors exceed that share of all events              | percent |
+| `SlowPageLoad` | Average load time over the window exceeds it        | milliseconds |
+
+Each rule has a cooldown, so a condition that stays true alerts once rather than
+on every sweep. `ErrorRate` ignores windows under 20 events and `SlowPageLoad`
+under 5 samples, where the numbers are noise rather than signal. A rule may carry
+a webhook URL; the notification is recorded either way, so a dead webhook never
+means a lost alert.
+
 ## API surface
 
 Queries: `me`, `myTenant`, `apiKeys`, `dashboardStats`, `errors`,
 `errorStatusCounts`, `errorDetails`, `errorTimeSeries`, `performanceTimeSeries`,
 `webVitals`, `deviceBreakdown`, `apiErrors`, `customEvents`, `businessFlows`,
-`dashboardLayouts`.
+`dashboardLayouts`, `alertRules`, `alertNotifications`.
 
 Mutations: `register`, `login`, `refreshSession`, `logout`, `changePassword`,
-`createApiKey`, `revokeApiKey`, `updateErrorStatus`, `saveDashboardLayout`,
-`deleteDashboardLayout`, and the SDK's `ingest*` family.
+`createApiKey`, `revokeApiKey`, `setApiKeyAllowedOrigins`, `updateErrorStatus`,
+`saveDashboardLayout`, `deleteDashboardLayout`, `createAlertRule`,
+`updateAlertRule`, `deleteAlertRule`, `markAlertNotificationsRead`, and the SDK's
+`ingest*` family.
 
 Behaviour worth knowing:
 
@@ -133,16 +185,30 @@ Behaviour worth knowing:
     and changing a password revokes every session.
 -   Ingest is size-capped (500 events per type per batch, plus per-field
     limits); auth mutations allow 10 attempts per 15 minutes per IP + identity.
+-   Ingest is also rate limited per API key, charged by event count rather than
+    request count — one batch can carry 2000 events, so counting requests would
+    measure the wrong thing.
 -   Each tenant has a monthly event quota (100k by default); ingestion is
     rejected past it.
+-   Email is unique in the database, not just checked before insert, so two
+    simultaneous sign-ups cannot both claim an address.
+-   Queries deeper than `MAX_QUERY_DEPTH` are rejected during validation,
+    before any resolver runs.
+-   A retention sweep deletes ingested events older than `RETENTION_DAYS` in
+    bounded chunks, along with refresh tokens that can no longer be redeemed.
+    `ErrorLog` is exempt: it is the issue list with triage status, not raw
+    event data.
 
 ## Tests
 
 ```bash
-cd backend && npm test     # 46 unit tests
-cd sdk && npm test         # 25 jsdom tests
+npm install && npm run lint   # ESLint across all three workspaces
+cd backend   && npm test      # 91 unit tests
+cd sdk       && npm test      # 25 jsdom tests
+cd dashboard && npm test      # 20 jsdom tests
 cd dashboard && npm run typecheck && npm run build
 ```
 
-CI (`.github/workflows/ci.yml`) runs all three, applies every migration to a
-clean MySQL, and fails on `schema.prisma` drift from the migration history.
+## License
+
+MIT — see [LICENSE](LICENSE).

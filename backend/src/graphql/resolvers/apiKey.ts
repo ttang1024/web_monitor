@@ -1,5 +1,5 @@
 import * as apiKeyService from '../../services/apiKeyService.js'
-import { createApiKeySchema, validate } from '../../lib/validation.js'
+import { allowedOriginsSchema, createApiKeySchema, validate } from '../../lib/validation.js'
 import { requireAuth } from '../guards.js'
 import type { CreateApiKeyInput, GraphQLContext } from '../../types.js'
 
@@ -19,6 +19,14 @@ export const apiKeyResolvers = {
     revokeApiKey: async (_: unknown, { id }: { id: string }, ctx: GraphQLContext) => {
       const auth = requireAuth(ctx)
       return apiKeyService.revokeApiKey(auth.tenantId, id)
+    },
+    setApiKeyAllowedOrigins: async (
+      _: unknown,
+      { id, origins }: { id: string; origins: string[] },
+      ctx: GraphQLContext
+    ) => {
+      const auth = requireAuth(ctx)
+      return apiKeyService.setAllowedOrigins(auth.tenantId, id, validate(allowedOriginsSchema, origins))
     },
   },
 }

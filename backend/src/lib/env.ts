@@ -13,6 +13,29 @@ const envSchema = z.object({
   ALLOWED_ORIGINS: z.string().default(''),
   ACCESS_TOKEN_TTL: z.string().default('24h'),
   REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(30),
+
+  // Ingest throttling, per API key. The monthly quota alone lets one page burn
+  // a month of allowance in minutes, which this bounds.
+  INGEST_EVENTS_PER_MINUTE: z.coerce.number().int().positive().default(6000),
+
+  // A deeply nested query costs the database far more than it costs the client
+  // to send. Rejected before execution.
+  MAX_QUERY_DEPTH: z.coerce.number().int().positive().default(12),
+
+  // Retention. Event tables are append-only and would otherwise grow forever.
+  RETENTION_DAYS: z.coerce.number().int().positive().default(90),
+  RETENTION_SWEEP_HOURS: z.coerce.number().int().positive().default(24),
+  RETENTION_ENABLED: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((value) => value === 'true'),
+
+  // Alert evaluation runs on a timer rather than on the ingest path.
+  ALERTS_ENABLED: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((value) => value === 'true'),
+  ALERT_INTERVAL_SECONDS: z.coerce.number().int().positive().default(60),
 })
 
 function loadEnv() {

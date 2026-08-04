@@ -17,6 +17,17 @@ import type {
   IngestPerformanceInput,
 } from '../../types.js'
 
+/**
+ * Number of events a batch is charged for, counted off the raw input before
+ * validation — a request that is rejected for being oversized still has to cost
+ * the sender something, or the limiter is trivially bypassed by sending junk.
+ */
+function batchCost(input: BatchIngestInput): number {
+  const lists = [input?.errors, input?.performance, input?.apiErrors, input?.customEvents]
+  const total = lists.reduce((sum, list) => sum + (Array.isArray(list) ? list.length : 0), 0)
+  return Math.max(total, 1)
+}
+
 export const sdkResolvers = {
   Mutation: {
     ingestError: async (_: unknown, { input }: { input: IngestErrorInput }, ctx: GraphQLContext) => {
@@ -49,7 +60,7 @@ export const sdkResolvers = {
       return true
     },
     ingestBatch: async (_: unknown, { input }: { input: BatchIngestInput }, ctx: GraphQLContext) => {
-      const { tenantId } = await requireApiKey(ctx)
+      const { tenantId } = await requireApiKey(ctx, batchCost(input))
       await monitoringService.ingestBatch(tenantId, validate(batchIngestSchema, input) as BatchIngestInput)
       return true
     },

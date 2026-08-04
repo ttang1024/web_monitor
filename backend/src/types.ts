@@ -104,4 +104,6 @@ export interface GraphQLContext {
   apiKeyHeader?: string
   /** Caller address, used to key auth rate limiting. */
   ip?: string
+  /** Request Origin header, checked against the API key's allowlist. */
+  origin?: string
 }

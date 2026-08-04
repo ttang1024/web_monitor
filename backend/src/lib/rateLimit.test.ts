@@ -52,6 +52,25 @@ describe('RateLimiter', () => {
     expect(() => limiter.hit('key', now + 15_000)).toThrow(/45s/)
   })
 
+  // Ingest charges the event count, not one per request: a batch mutation can
+  // carry hundreds of events, and counting requests measures the wrong thing.
+  it('charges the given cost against the window', () => {
+    const limiter = new RateLimiter(100, 1_000)
+    const now = 1_000_000
+
+    limiter.hit('key', now, 60)
+    expect(() => limiter.hit('key', now, 30)).not.toThrow()
+    expect(() => limiter.hit('key', now, 30)).toThrow(RateLimitedError)
+  })
+
+  it('rejects a single charge larger than the whole limit', () => {
+    const limiter = new RateLimiter(100, 1_000)
+
+    // Even on a fresh window — otherwise a caller exceeds the limit whenever
+    // its oversized batch happens to be the one that opens the window.
+    expect(() => limiter.hit('key', 1_000_000, 500)).toThrow(RateLimitedError)
+  })
+
   it('stays bounded when flooded with distinct keys', () => {
     const limiter = new RateLimiter(5, 1_000, 100)
     for (let index = 0; index < 500; index++) {

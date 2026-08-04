@@ -1,5 +1,4 @@
-import React from 'react';
-import { 
+import {
   Activity, 
   AlertTriangle, 
   BarChart2, 
@@ -39,7 +38,11 @@ import {
   Copy,
   KeyRound,
   Code2,
-  Ban
+  Ban,
+  Bell,
+  BellOff,
+  ShieldCheck,
+  Pencil
 } from 'lucide-react';
 
 export const Icons = {
@@ -83,5 +86,9 @@ export const Icons = {
   Copy,
   Key: KeyRound,
   Code: Code2,
-  Ban
+  Ban,
+  Bell,
+  BellOff,
+  Shield: ShieldCheck,
+  Pencil
 };

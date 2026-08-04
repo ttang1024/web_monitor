@@ -7,6 +7,7 @@
 export function throwUncaughtError() {
 	// setTimeout so the error escapes the caller's try/catch (if any)
 	setTimeout(() => {
+		// eslint-disable-next-line no-undef -- undefined on purpose: calling it is what raises the error this example demonstrates
 		nonExistentFunction()
 	}, 0)
 }

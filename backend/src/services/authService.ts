@@ -9,6 +9,7 @@ import {
   verifyPassword,
 } from '../lib/auth.js'
 import * as tenantService from './tenantService.js'
+import { Prisma } from '@prisma/client'
 import type { LoginInput, RegisterInput } from '../types.js'
 import type { Tenant, User } from '@prisma/client'
 
@@ -78,26 +79,48 @@ async function issueSession(user: User, tenant: Tenant): Promise<LoginResponse> 
 }
 
 export async function register(input: RegisterInput): Promise<LoginResponse> {
-  const existingUser = await prisma.user.findFirst({ where: { email: input.email } })
+  // Checked up front so the common case gets a clear message without creating
+  // a tenant first — but this is not what guarantees uniqueness, since two
+  // simultaneous sign-ups can both pass it. The unique index below does.
+  const existingUser = await prisma.user.findUnique({ where: { email: input.email } })
   if (existingUser) {
     throw new BadRequestError('Email already registered')
   }
 
   const tenant = await tenantService.createTenant(input.tenantName, input.domain)
 
-  const user = await prisma.user.create({
-    data: {
-      tenantId: tenant.id,
-      email: input.email,
-      passwordHash: hashPassword(input.password),
-      firstName: input.firstName,
-      lastName: input.lastName,
-      role: 'Admin',
-      isActive: true,
-    },
-  })
+  try {
+    const user = await prisma.user.create({
+      data: {
+        tenantId: tenant.id,
+        email: input.email,
+        passwordHash: hashPassword(input.password),
+        firstName: input.firstName,
+        lastName: input.lastName,
+        role: 'Admin',
+        isActive: true,
+      },
+    })
 
-  return issueSession(user, tenant)
+    return issueSession(user, tenant)
+  } catch (error) {
+    // Lost the race for this address. The tenant created a moment ago now has
+    // no user and never will, so remove it rather than leave an orphan holding
+    // an API key.
+    await prisma.tenant.delete({ where: { id: tenant.id } }).catch(() => {})
+
+    if (isUniqueViolation(error, 'email')) {
+      throw new BadRequestError('Email already registered')
+    }
+    throw error
+  }
+}
+
+/** True for Prisma's "unique constraint failed" on the given field. */
+function isUniqueViolation(error: unknown, field: string): boolean {
+  if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== 'P2002') return false
+  const target = error.meta?.target
+  return Array.isArray(target) ? target.includes(field) : String(target ?? '').includes(field)
 }
 
 export async function login(input: LoginInput): Promise<LoginResponse> {

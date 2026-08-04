@@ -26,6 +26,23 @@ enum ErrorStatus {
   Regressed
 }
 
+enum AlertCondition {
+  // An error hash reported for the first time inside the window.
+  NewIssue
+  // Total error occurrences in the window exceeded the threshold.
+  ErrorSpike
+  // Errors as a percentage of all events in the window exceeded the threshold.
+  ErrorRate
+  // Average page load time over the window exceeded the threshold, in ms.
+  SlowPageLoad
+}
+
+enum AlertSeverity {
+  Info
+  Warning
+  Critical
+}
+
 model Tenant {
   id                 String           @id @default(uuid()) @db.Char(36)
   name               String
@@ -48,6 +65,8 @@ model Tenant {
   apiErrors         ApiError[]
   customEvents      CustomEvent[]
   dashboardLayouts  DashboardLayout[]
+  alertRules        AlertRule[]
+  alertNotifications AlertNotification[]
 }
 
 model User {
@@ -67,7 +86,10 @@ model User {
   dashboardLayouts DashboardLayout[]
   refreshTokens    RefreshToken[]
 
-  @@index([email])
+  // Login looks users up by email alone, so the address has to be unique
+  // globally — not just per tenant. Enforced in the database because the
+  // application-level "is this taken?" check races with itself.
+  @@unique([email])
   @@index([tenantId])
 }
 
@@ -94,6 +116,10 @@ model ApiKey {
   expiresAt      DateTime?
   lastUsedAt     DateTime?
   environment    String    @default("production")
+  // JSON array of origins ("https://app.example.com") allowed to ingest with
+  // this key. An ingest key ships in public page source, so this is the only
+  // thing stopping someone else's site from spending the quota. Empty or null
+  // means "any origin", which is what a brand new key starts as.
   allowedOrigins Json?
   createdAt      DateTime  @default(now())
   updatedAt      DateTime? @updatedAt
@@ -210,6 +236,63 @@ model CustomEvent {
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
   @@index([tenantId, eventName, createdAt])
+}
+
+// A condition the tenant wants to hear about. Evaluated on a fixed interval
+// against the window ending now, not on the ingest path — a burst of 500 errors
+// should cost one evaluation, not 500.
+model AlertRule {
+  id       String         @id @default(uuid()) @db.Char(36)
+  tenantId String         @db.Char(36)
+  name     String
+  condition AlertCondition
+  // Interpreted per condition: occurrences (ErrorSpike), percent (ErrorRate),
+  // milliseconds (SlowPageLoad). Ignored by NewIssue.
+  threshold Float         @default(0)
+  windowMinutes Int       @default(60)
+  severity AlertSeverity  @default(Warning)
+  isEnabled Boolean       @default(true)
+  // A condition that stays true would otherwise fire on every sweep. After a
+  // rule triggers it stays quiet for this long.
+  cooldownMinutes Int     @default(60)
+  lastTriggeredAt DateTime?
+  // Optional outbound POST when the rule fires. Notifications are recorded
+  // either way, so delivery failing never loses the alert.
+  webhookUrl String?      @db.Text
+  createdAt DateTime      @default(now())
+  updatedAt DateTime?     @updatedAt
+
+  tenant        Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  notifications AlertNotification[]
+
+  @@index([tenantId, isEnabled])
+}
+
+// One firing of a rule. Kept even when webhook delivery fails so the dashboard
+// is always the complete record.
+model AlertNotification {
+  id          String        @id @default(uuid()) @db.Char(36)
+  tenantId    String        @db.Char(36)
+  alertRuleId String        @db.Char(36)
+  title       String
+  body        String        @db.Text
+  severity    AlertSeverity
+  // What the rule measured, against what it was compared to.
+  observedValue Float
+  threshold   Float
+  // Set for NewIssue, so the dashboard can link straight to the issue.
+  errorHash   String?
+  isRead      Boolean       @default(false)
+  deliveredAt DateTime?
+  deliveryError String?     @db.Text
+  createdAt   DateTime      @default(now())
+
+  tenant Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  rule   AlertRule @relation(fields: [alertRuleId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, isRead])
+  @@index([alertRuleId])
 }
 
 model DashboardLayout {

@@ -8,6 +8,23 @@ enum ErrorStatus {
   Regressed
 }
 
+enum AlertCondition {
+  "An error hash reported for the first time inside the window."
+  NewIssue
+  "Total error occurrences in the window exceeded the threshold."
+  ErrorSpike
+  "Errors as a percentage of all events in the window exceeded the threshold."
+  ErrorRate
+  "Average page load time over the window exceeded the threshold, in ms."
+  SlowPageLoad
+}
+
+enum AlertSeverity {
+  Info
+  Warning
+  Critical
+}
+
 """
 The ingestion credential a page's SDK authenticates with. Returned in full to
 authenticated members of the owning tenant — there is no other way to install
@@ -21,6 +38,8 @@ type ApiKey {
   isActive: Boolean!
   lastUsedAt: DateTime
   expiresAt: DateTime
+  "Origins permitted to ingest with this key. Empty means any origin."
+  allowedOrigins: [String!]!
   createdAt: DateTime!
 }
 
@@ -188,6 +207,71 @@ type PerformanceTimeSeriesPoint {
   count: Int!
 }
 
+type AlertRule {
+  id: ID!
+  name: String!
+  condition: AlertCondition!
+  "Occurrences (ErrorSpike), percent (ErrorRate), or milliseconds (SlowPageLoad). Ignored by NewIssue."
+  threshold: Float!
+  windowMinutes: Int!
+  severity: AlertSeverity!
+  isEnabled: Boolean!
+  "Quiet period after the rule fires, so a persistently true condition alerts once."
+  cooldownMinutes: Int!
+  lastTriggeredAt: DateTime
+  webhookUrl: String
+  createdAt: DateTime!
+  updatedAt: DateTime
+}
+
+"One firing of a rule. Recorded even when webhook delivery fails."
+type AlertNotification {
+  id: ID!
+  alertRuleId: ID!
+  ruleName: String!
+  title: String!
+  body: String!
+  severity: AlertSeverity!
+  observedValue: Float!
+  threshold: Float!
+  "Set for NewIssue alerts, so the dashboard can link to the issue."
+  errorHash: String
+  isRead: Boolean!
+  deliveredAt: DateTime
+  deliveryError: String
+  createdAt: DateTime!
+}
+
+type AlertNotificationPage {
+  total: Int!
+  page: Int!
+  pageSize: Int!
+  unread: Int!
+  data: [AlertNotification!]!
+}
+
+input AlertRuleInput {
+  name: String!
+  condition: AlertCondition!
+  threshold: Float = 0
+  windowMinutes: Int = 60
+  severity: AlertSeverity = Warning
+  cooldownMinutes: Int = 60
+  webhookUrl: String
+  isEnabled: Boolean = true
+}
+
+input UpdateAlertRuleInput {
+  name: String
+  condition: AlertCondition
+  threshold: Float
+  windowMinutes: Int
+  severity: AlertSeverity
+  cooldownMinutes: Int
+  webhookUrl: String
+  isEnabled: Boolean
+}
+
 type DashboardLayout {
   id: ID!
   userId: ID!
@@ -325,6 +409,8 @@ type Query {
   "Completion/failure rates per business flow tracked with startFlow()."
   businessFlows(startDate: DateTime, endDate: DateTime): [BusinessFlowStat!]!
   dashboardLayouts: [DashboardLayout!]!
+  alertRules: [AlertRule!]!
+  alertNotifications(page: Int = 1, pageSize: Int = 50, unreadOnly: Boolean = false): AlertNotificationPage!
 }
 
 type Mutation {
@@ -338,6 +424,14 @@ type Mutation {
 
   createApiKey(input: CreateApiKeyInput!): ApiKey!
   revokeApiKey(id: ID!): ApiKey!
+  "Restricts which origins may ingest with this key. An empty list means any origin."
+  setApiKeyAllowedOrigins(id: ID!, origins: [String!]!): ApiKey!
+
+  createAlertRule(input: AlertRuleInput!): AlertRule!
+  updateAlertRule(id: ID!, input: UpdateAlertRuleInput!): AlertRule!
+  deleteAlertRule(id: ID!): Boolean!
+  "Marks the given notifications read, or every unread one when ids are omitted."
+  markAlertNotificationsRead(ids: [ID!]): Int!
 
   updateErrorStatus(id: ID!, status: ErrorStatus!): ErrorLog!
 

@@ -1,0 +1,18 @@
+{
+  "semi": false,
+  "singleQuote": true,
+  "printWidth": 115,
+  "trailingComma": "es5",
+  "arrowParens": "always",
+  "overrides": [
+    {
+      "comment": "The dashboard was written with semicolons and the SDK with tabs; reformatting either would bury real changes under a whole-file diff.",
+      "files": "dashboard/**/*.{ts,tsx}",
+      "options": { "semi": true }
+    },
+    {
+      "files": "sdk/**/*.js",
+      "options": { "useTabs": true, "semi": false }
+    }
+  ]
+}

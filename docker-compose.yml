@@ -1,0 +1,61 @@
+# Full stack: MySQL, the API and the dashboard.
+#
+# `backend/docker-compose.yml` is the development counterpart to this — it
+# brings up MySQL alone, so the API can run from source with `npm run dev`.
+# This file is for running the built images.
+
+services:
+  mysql:
+    image: mysql:8
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-yourpassword}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-monitoring_saas}
+    volumes:
+      - monitoring-mysql-data:/var/lib/mysql
+    healthcheck:
+      # The API's migration step fails outright against a database that is still
+      # starting, so nothing else may start until this passes.
+      test: ['CMD', 'mysqladmin', 'ping', '-h', 'localhost', '-uroot', '-p${MYSQL_ROOT_PASSWORD:-yourpassword}']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: mysql://root:${MYSQL_ROOT_PASSWORD:-yourpassword}@mysql:3306/${MYSQL_DATABASE:-monitoring_saas}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set and at least 32 characters}
+      JWT_ISSUER: ${JWT_ISSUER:-MonitoringSaaS}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-MonitoringSaasUsers}
+      NODE_ENV: production
+      PORT: 4000
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:8080}
+      RETENTION_DAYS: ${RETENTION_DAYS:-90}
+      ALERTS_ENABLED: ${ALERTS_ENABLED:-true}
+    ports:
+      - '4000:4000'
+    # Migrations run at start rather than in the image build, which has no
+    # database to apply them to.
+    command: sh -c "npx prisma migrate deploy && node dist/index.js"
+
+  dashboard:
+    build:
+      context: ./dashboard
+      args:
+        # Baked into the bundle at build time, so changing this needs a rebuild.
+        API_URL: ${DASHBOARD_API_URL:-http://localhost:4000/graphql}
+        GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - '8080:80'
+
+volumes:
+  monitoring-mysql-data:

@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto'
 import type { ApiKey } from '@prisma/client'
 import { prisma } from '../prisma.js'
 import { invalidateApiKey } from '../lib/apiKey.js'
+import { parseAllowedOrigins } from '../lib/origin.js'
 import { BadRequestError, NotFoundError } from '../lib/errors.js'
 
 export function generateApiKey(): string {
@@ -16,6 +17,7 @@ export interface ApiKeyDto {
   isActive: boolean
   lastUsedAt: Date | null
   expiresAt: Date | null
+  allowedOrigins: string[]
   createdAt: Date
 }
 
@@ -28,6 +30,7 @@ export function toApiKeyDto(apiKey: ApiKey): ApiKeyDto {
     isActive: apiKey.isActive,
     lastUsedAt: apiKey.lastUsedAt,
     expiresAt: apiKey.expiresAt,
+    allowedOrigins: parseAllowedOrigins(apiKey.allowedOrigins),
     createdAt: apiKey.createdAt,
   }
 }
@@ -59,6 +62,38 @@ export async function createApiKey(
   })
 
   return toApiKeyDto(apiKey)
+}
+
+/**
+ * Replaces the key's origin allowlist. An empty list restores "any origin",
+ * which is how a key is created.
+ */
+export async function setAllowedOrigins(
+  tenantId: string,
+  apiKeyId: string,
+  origins: string[]
+): Promise<ApiKeyDto> {
+  const apiKey = await prisma.apiKey.findFirst({ where: { id: apiKeyId, tenantId } })
+  if (!apiKey) throw new NotFoundError('API key not found')
+
+  // Stored normalised so the ingest-path comparison is a plain string match,
+  // and so "https://a.com/" and "https://a.com" can't both sit in the list.
+  const normalized = [...new Set(parseAllowedOrigins(origins))]
+  if (origins.length > 0 && normalized.length === 0) {
+    throw new BadRequestError('No usable origins provided')
+  }
+
+  const updated = await prisma.apiKey.update({
+    where: { id: apiKey.id },
+    data: { allowedOrigins: normalized },
+  })
+
+  // The resolve cache holds the old allowlist for up to 15 minutes otherwise,
+  // which would leave a just-restricted key accepting the origins it was
+  // restricted away from.
+  invalidateApiKey(apiKey.key)
+
+  return toApiKeyDto(updated)
 }
 
 export async function revokeApiKey(tenantId: string, apiKeyId: string): Promise<ApiKeyDto> {

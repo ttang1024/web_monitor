@@ -18,12 +18,20 @@ import {
 import { MOCK_COLORS } from '../../constants';
 
 interface ChartProps {
-  data: any[];
+  // Recharts reads series values off arbitrary keys, so the row shape is
+  // whatever the widget feeding it decided to emit.
+  data: Record<string, string | number>[];
   color?: string;
   theme?: 'light' | 'dark';
 }
 
-const CustomTooltip = ({ active, payload, label }: any) => {
+interface TooltipProps {
+  active?: boolean;
+  payload?: { value: number | string; name?: string }[];
+  label?: string | number;
+}
+
+const CustomTooltip = ({ active, payload, label }: TooltipProps) => {
   if (active && payload && payload.length) {
     return (
       <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-2 rounded shadow-xl text-xs">

@@ -1,4 +1,4 @@
-import { z, ZodSchema } from 'zod'
+import { z, ZodSchema, ZodTypeAny } from 'zod'
 import { BadRequestError } from './errors.js'
 
 export const registerSchema = z.object({
@@ -24,6 +24,57 @@ export const createApiKeySchema = z.object({
   name: z.string().min(1, 'Name is required').max(100),
   environment: z.enum(['production', 'staging', 'development']).default('production'),
 })
+
+// --- Alerts -----------------------------------------------------------------
+
+const alertCondition = z.enum(['NewIssue', 'ErrorSpike', 'ErrorRate', 'SlowPageLoad'])
+const alertSeverity = z.enum(['Info', 'Warning', 'Critical'])
+
+// Only http(s) is accepted, and only an absolute URL: the rule's webhook is a
+// server-side outbound request the tenant controls, so it must not be
+// addressable at other schemes.
+const webhookUrl = z
+  .string()
+  .max(2_048)
+  .refine((value) => {
+    try {
+      return ['http:', 'https:'].includes(new URL(value).protocol)
+    } catch {
+      return false
+    }
+  }, 'Webhook must be an http(s) URL')
+
+export const createAlertRuleSchema = z.object({
+  name: z.string().min(1, 'Name is required').max(120),
+  condition: alertCondition,
+  threshold: z.number().finite().nonnegative().max(1_000_000).default(0),
+  // A window under a minute would re-read the same data every sweep; a month
+  // is already far longer than anything worth alerting on.
+  windowMinutes: z.number().int().min(1).max(43_200).default(60),
+  severity: alertSeverity.default('Warning'),
+  cooldownMinutes: z.number().int().min(0).max(43_200).default(60),
+  webhookUrl: webhookUrl.nullish(),
+  isEnabled: z.boolean().default(true),
+})
+
+export const updateAlertRuleSchema = createAlertRuleSchema.partial()
+
+// Origins are stored as written but must parse as absolute http(s) URLs, or the
+// allowlist silently matches nothing.
+export const allowedOriginsSchema = z
+  .array(
+    z
+      .string()
+      .max(255)
+      .refine((value) => {
+        try {
+          return ['http:', 'https:'].includes(new URL(value).protocol)
+        } catch {
+          return false
+        }
+      }, 'Each origin must be an http(s) URL, e.g. https://app.example.com')
+  )
+  .max(50, 'At most 50 origins per key')
 
 // --- Ingest -----------------------------------------------------------------
 // The SDK is an untrusted client, so everything it sends is bounded here: one
@@ -118,7 +169,13 @@ export const batchIngestSchema = z.object({
   customEvents: batchList(ingestCustomEventSchema),
 })
 
-export function validate<T>(schema: ZodSchema<T>, input: unknown): T {
+/**
+ * Inferred from the schema's *output* type, not its input. A schema using
+ * `.default()` accepts a value the caller may omit but always produces one, and
+ * inferring from the input would hand the caller back an optional it then has
+ * to re-check.
+ */
+export function validate<S extends ZodTypeAny>(schema: S, input: unknown): z.output<S> {
   const result = schema.safeParse(input)
   if (!result.success) {
     const errors: Record<string, string[]> = {}

@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Icons } from '../ui/Icons';
 import { useApi } from '../../hooks/useApi';
-import { ApiKey, createApiKey, listApiKeys, revokeApiKey } from '../../services/api';
+import { ApiKey, createApiKey, listApiKeys, revokeApiKey, setApiKeyAllowedOrigins } from '../../services/api';
 import { formatRelative } from '../../services/timeRange';
 
 interface OverviewPageProps {
@@ -37,6 +37,107 @@ const CopyButton: React.FC<{ value: string; label?: string }> = ({ value, label 
       {copied ? <Icons.CheckMark size={12} className="text-green-500" /> : <Icons.Copy size={12} />}
       {copied ? 'Copied' : label ?? 'Copy'}
     </button>
+  );
+};
+
+/**
+ * Editor for one key's origin allowlist.
+ *
+ * The key itself is public — it ships in the page source of every site it is
+ * installed on — so restricting the origins it may report from is the only
+ * thing that stops a copied key being used elsewhere. Empty means any origin,
+ * which is how a key starts, so the empty state says so plainly rather than
+ * looking like a misconfiguration.
+ */
+const AllowedOrigins: React.FC<{ apiKey: ApiKey; onSaved: () => void }> = ({ apiKey, onSaved }) => {
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState(apiKey.allowedOrigins.join('\n'));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const save = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const origins = value
+        .split(/[\n,]/)
+        .map((origin) => origin.trim())
+        .filter(Boolean);
+      await setApiKeyAllowedOrigins(apiKey.id, origins);
+      setEditing(false);
+      onSaved();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not save the allowlist.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!editing) {
+    return (
+      <div className="flex items-center gap-2 flex-wrap text-xs">
+        <span className="flex items-center gap-1 text-slate-500">
+          <Icons.Shield size={12} />
+          Origins:
+        </span>
+        {apiKey.allowedOrigins.length === 0 ? (
+          <span className="text-yellow-600 dark:text-yellow-400">any (unrestricted)</span>
+        ) : (
+          apiKey.allowedOrigins.map((origin) => (
+            <code
+              key={origin}
+              className="font-mono bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded px-1.5 py-0.5 text-slate-600 dark:text-slate-300"
+            >
+              {origin}
+            </code>
+          ))
+        )}
+        <button
+          onClick={() => {
+            setValue(apiKey.allowedOrigins.join('\n'));
+            setEditing(true);
+          }}
+          className="text-primary-600 dark:text-primary-400 underline"
+        >
+          Edit
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      <label className="flex items-center gap-1 text-xs text-slate-500">
+        <Icons.Shield size={12} />
+        Allowed origins — one per line. Leave empty to allow any.
+      </label>
+      <textarea
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        rows={3}
+        placeholder={'https://app.example.com\nhttps://checkout.example.com'}
+        className="w-full font-mono text-xs bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded px-2 py-1.5 text-slate-700 dark:text-slate-300 focus:outline-none focus:border-primary-500"
+      />
+      {error && <p className="text-xs text-red-600 dark:text-red-400">{error}</p>}
+      <div className="flex items-center gap-2">
+        <button
+          onClick={save}
+          disabled={busy}
+          className="text-xs px-2 py-1 rounded bg-primary-600 hover:bg-primary-500 text-white disabled:opacity-50 transition-colors"
+        >
+          {busy ? 'Saving…' : 'Save'}
+        </button>
+        <button
+          onClick={() => {
+            setEditing(false);
+            setError(null);
+          }}
+          className="text-xs px-2 py-1 rounded border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
   );
 };
 
@@ -169,6 +270,8 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({ onOpenDashboards }) 
                   </button>
                   <CopyButton value={key.key} label="Key" />
                 </div>
+
+                <AllowedOrigins apiKey={key} onSaved={refetch} />
 
                 <details className="group/snippet">
                   <summary className="flex items-center gap-1.5 text-xs text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 cursor-pointer select-none">

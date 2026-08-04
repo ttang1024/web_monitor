@@ -68,7 +68,7 @@ export interface AIAnalysisResponse {
 
 // --- New Types for Pages ---
 
-export type Page = 'overview' | 'dashboard' | 'issues' | 'performance' | 'replays';
+export type Page = 'overview' | 'dashboard' | 'issues' | 'performance' | 'replays' | 'alerts';
 
 export interface Breadcrumb {
   timestamp: string;
