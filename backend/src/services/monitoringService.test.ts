@@ -1,19 +1,28 @@
+import { Prisma } from '@prisma/client'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const prismaMock = {
-  errorLog: { upsert: vi.fn(), updateMany: vi.fn() },
-  errorBucket: { upsert: vi.fn() },
-  performanceMetric: { create: vi.fn(), createMany: vi.fn() },
-  apiError: { create: vi.fn(), createMany: vi.fn() },
-  customEvent: { create: vi.fn(), createMany: vi.fn() },
-  tenant: { updateMany: vi.fn() },
+// The SQL itself is exercised against MySQL in monitoringService.int.test.ts;
+// these tests cover grouping, idempotency and retry orchestration.
+const tx = {
+  $executeRaw: vi.fn(),
+  ingestBatch: { create: vi.fn() },
+  performanceMetric: { createMany: vi.fn() },
+  apiError: { createMany: vi.fn() },
+  customEvent: { createMany: vi.fn() },
 }
+const prismaMock = {
+  $transaction: vi.fn((fn: (client: typeof tx) => Promise<unknown>) => fn(tx)),
+  $executeRaw: vi.fn(),
+}
+const incrementEventCount = vi.fn()
 
 vi.mock('../prisma.js', () => ({ prisma: prismaMock }))
+vi.mock('./tenantService.js', () => ({ incrementEventCount }))
 
-const { bucketStartFor, ingestBatch, resolveEventTime } = await import('./monitoringService.js')
+const { bucketStartFor, groupErrors, ingestBatch, resolveEventTime } = await import('./monitoringService.js')
 
 const TENANT = 'tenant-1'
+// Every test passes this as "now", so nothing depends on the real clock.
 const NOW = Date.UTC(2026, 7, 4, 12, 34, 56)
 
 function errorEvent(overrides: Record<string, unknown> = {}) {
@@ -28,19 +37,21 @@ function errorEvent(overrides: Record<string, unknown> = {}) {
   }
 }
 
+function knownError(code: string, meta?: Record<string, unknown>) {
+  return new Prisma.PrismaClientKnownRequestError('failed', { code, clientVersion: 'test', meta })
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
-  prismaMock.tenant.updateMany.mockResolvedValue({ count: 1 })
-  prismaMock.errorLog.updateMany.mockResolvedValue({ count: 0 })
+  prismaMock.$transaction.mockImplementation((fn) => fn(tx))
 })
 
 describe('bucketStartFor', () => {
-  it('floors a timestamp to its hour', () => {
+  it('floors a timestamp to its UTC hour', () => {
     expect(bucketStartFor(NOW).toISOString()).toBe('2026-08-04T12:00:00.000Z')
   })
 
   it('puts timestamps in the same hour in the same bucket', () => {
-    // 12:34:56 and 12:54:56 share a bucket; 13:34:56 starts a new one.
     expect(bucketStartFor(NOW).getTime()).toBe(bucketStartFor(NOW + 20 * 60 * 1000).getTime())
     expect(bucketStartFor(NOW).getTime()).not.toBe(bucketStartFor(NOW + 60 * 60 * 1000).getTime())
   })
@@ -57,94 +68,97 @@ describe('resolveEventTime', () => {
   })
 })
 
+describe('groupErrors', () => {
+  it('collapses identical errors into one group with the summed count', () => {
+    const { groups } = groupErrors([errorEvent(), errorEvent(), errorEvent()], NOW)
+    expect(groups).toHaveLength(1)
+    expect(groups[0].occurrences).toBe(3)
+  })
+
+  it('keeps errors with different signatures apart', () => {
+    const { groups } = groupErrors([errorEvent(), errorEvent({ message: 'other' })], NOW)
+    expect(groups).toHaveLength(2)
+  })
+
+  it('counts each occurrence into the hour it happened in', () => {
+    const { buckets } = groupErrors([errorEvent(), errorEvent({ timestamp: NOW + 60 * 60 * 1000 })], NOW)
+    expect(buckets.map((bucket) => [bucket.bucketStart.toISOString(), bucket.count])).toEqual([
+      ['2026-08-04T12:00:00.000Z', 1],
+      ['2026-08-04T13:00:00.000Z', 1],
+    ])
+  })
+
+  it('records the latest occurrence as lastSeenAt', () => {
+    const { groups } = groupErrors([errorEvent({ timestamp: NOW - 1_000 }), errorEvent()], NOW)
+    expect(groups[0].lastSeenAt.getTime()).toBe(NOW)
+  })
+
+  it('orders groups by hash so concurrent batches lock rows in the same order', () => {
+    const { groups } = groupErrors(
+      ['a', 'b', 'c', 'd', 'e'].map((message) => errorEvent({ message })),
+      NOW
+    )
+    const hashes = groups.map((group) => group.errorHash)
+    expect(hashes).toEqual([...hashes].sort())
+  })
+})
+
 describe('ingestBatch', () => {
-  it('collapses identical errors into one upsert with the summed count', async () => {
-    await ingestBatch(TENANT, { errors: [errorEvent(), errorEvent(), errorEvent()] })
-
-    expect(prismaMock.errorLog.upsert).toHaveBeenCalledTimes(1)
-    const call = prismaMock.errorLog.upsert.mock.calls[0][0]
-    expect(call.create.occurrenceCount).toBe(3)
-    expect(call.update.occurrenceCount).toEqual({ increment: 3 })
-  })
-
-  it('keeps errors with different signatures apart', async () => {
-    await ingestBatch(TENANT, {
-      errors: [errorEvent(), errorEvent({ message: 'other boom' }), errorEvent({ source: 'vendor.js' })],
-    })
-
-    expect(prismaMock.errorLog.upsert).toHaveBeenCalledTimes(3)
-  })
-
-  it('records an hourly bucket per error group so issues have a trend', async () => {
-    await ingestBatch(TENANT, { errors: [errorEvent(), errorEvent()] })
-
-    expect(prismaMock.errorBucket.upsert).toHaveBeenCalledTimes(1)
-    const call = prismaMock.errorBucket.upsert.mock.calls[0][0]
-    expect(call.create.count).toBe(2)
-    expect(call.create.bucketStart.toISOString()).toBe('2026-08-04T12:00:00.000Z')
-  })
-
-  it('reopens a resolved error as a regression', async () => {
-    await ingestBatch(TENANT, { errors: [errorEvent()] })
-
-    expect(prismaMock.errorLog.updateMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({ status: 'Resolved' }),
-        data: { status: 'Regressed' },
-      })
+  it('writes a whole batch in a fixed number of statements', async () => {
+    await ingestBatch(
+      TENANT,
+      {
+        errors: Array.from({ length: 50 }, (_, index) => errorEvent({ message: `distinct ${'x'.repeat(index)}` })),
+        performance: [{ url: 'https://x', userAgent: 'ua', timestamp: NOW, metrics: { load: 1200 } }],
+      },
+      NOW
     )
+
+    // One upsert for all errors, one for all buckets — not one per error.
+    expect(tx.$executeRaw).toHaveBeenCalledTimes(2)
+    expect(tx.performanceMetric.createMany).toHaveBeenCalledTimes(1)
   })
 
-  it('writes the other event types in bulk', async () => {
-    await ingestBatch(TENANT, {
-      performance: [
-        {
-          url: 'https://example.com/',
-          userAgent: 'UA',
-          timestamp: NOW,
-          metrics: { lcp: 2000, load: 3000 },
-          device: { type: 'desktop', browser: 'Chrome', os: 'macOS' },
-        },
-      ],
-      apiErrors: [
-        {
-          type: 'http_error',
-          requestUrl: 'https://api.example.com/cart',
-          method: 'POST',
-          status: 500,
-          url: 'https://example.com/',
-          userAgent: 'UA',
-          timestamp: NOW,
-        },
-      ],
-      customEvents: [
-        { name: 'signup', url: 'https://example.com/', userAgent: 'UA', timestamp: NOW, data: { plan: 'pro' } },
-      ],
-    })
-
-    expect(prismaMock.performanceMetric.createMany).toHaveBeenCalledTimes(1)
-    expect(prismaMock.apiError.createMany).toHaveBeenCalledTimes(1)
-    expect(prismaMock.customEvent.createMany).toHaveBeenCalledTimes(1)
-  })
-
-  it('bills every event in the batch, not every write', async () => {
-    await ingestBatch(TENANT, {
-      errors: [errorEvent(), errorEvent()],
-      customEvents: [
-        { name: 'signup', url: 'https://example.com/', userAgent: 'UA', timestamp: NOW, data: {} },
-      ],
-    })
-
-    expect(prismaMock.tenant.updateMany).toHaveBeenCalledWith(
-      expect.objectContaining({ data: { currentMonthEvents: { increment: 3 } } })
+  it('bills every event in the batch once, after the write commits', async () => {
+    await ingestBatch(
+      TENANT,
+      {
+        errors: [errorEvent(), errorEvent()],
+        apiErrors: [{ type: 'http_error', requestUrl: '/api', method: 'GET', url: 'https://x', userAgent: 'ua', timestamp: NOW }],
+      },
+      NOW
     )
+    expect(incrementEventCount).toHaveBeenCalledWith(TENANT, 3)
+  })
+
+  it('skips a batch whose id was already stored', async () => {
+    tx.ingestBatch.create.mockRejectedValueOnce(knownError('P2002'))
+
+    const result = await ingestBatch(TENANT, { batchId: 'batch-0001', errors: [errorEvent()] }, NOW)
+
+    expect(result).toEqual({ accepted: 0, duplicate: true })
+    expect(tx.$executeRaw).not.toHaveBeenCalled()
+    expect(incrementEventCount).not.toHaveBeenCalled()
+  })
+
+  it('retries a transaction chosen as a deadlock victim', async () => {
+    prismaMock.$transaction.mockRejectedValueOnce(knownError('P2034')).mockImplementation((fn) => fn(tx))
+
+    const result = await ingestBatch(TENANT, { errors: [errorEvent()] }, NOW)
+
+    expect(result.accepted).toBe(1)
+    expect(prismaMock.$transaction).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not retry other failures', async () => {
+    prismaMock.$transaction.mockRejectedValueOnce(new Error('connection lost'))
+    await expect(ingestBatch(TENANT, { errors: [errorEvent()] }, NOW)).rejects.toThrow('connection lost')
+    expect(prismaMock.$transaction).toHaveBeenCalledTimes(1)
   })
 
   it('does not touch the database for an empty batch', async () => {
-    await ingestBatch(TENANT, {})
-
-    expect(prismaMock.errorLog.upsert).not.toHaveBeenCalled()
-    expect(prismaMock.performanceMetric.createMany).not.toHaveBeenCalled()
-    expect(prismaMock.tenant.updateMany).not.toHaveBeenCalled()
+    await ingestBatch(TENANT, {}, NOW)
+    expect(prismaMock.$transaction).not.toHaveBeenCalled()
+    expect(incrementEventCount).not.toHaveBeenCalled()
   })
 })

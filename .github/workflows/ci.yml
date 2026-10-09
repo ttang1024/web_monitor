@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      # format:check is not enforced yet: older files predate the Prettier
+      # config, and reformatting them wholesale is a separate, deliberate commit.
+
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: ci
+          MYSQL_DATABASE: monitoring_test
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -pci"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: --health-cmd "redis-cli ping" --health-interval 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+      - run: npx prisma generate
+      - run: npm run typecheck
+      - run: npm test
+      # Fails if schema.prisma changed without a migration.
+      - name: Check migrations match the schema
+        env:
+          DATABASE_URL: mysql://root:ci@127.0.0.1:3306/monitoring_test
+        run: |
+          npx prisma migrate deploy
+          npx prisma migrate diff --from-url "$DATABASE_URL" --to-schema-datamodel prisma/schema.prisma --exit-code
+      - name: Integration tests (MySQL + Redis)
+        env:
+          TEST_DATABASE_URL: mysql://root:ci@127.0.0.1:3306/monitoring_test
+          TEST_REDIS_URL: redis://127.0.0.1:6379
+        run: npm run test:int
+      - run: npm run build
+
+  dashboard:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+      # Generated types must match the backend schema.
+      - run: npm run codegen:check
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  sdk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: sdk/package-lock.json
+      - run: npm ci
+      - run: npm test
+
+  images:
+    runs-on: ubuntu-latest
+    needs: [backend, dashboard]
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t web-monitor-api backend
+      - run: docker build -t web-monitor-dashboard dashboard
+      # The dashboard image's nginx config (security headers include) must load.
+      - run: docker run --rm web-monitor-dashboard nginx -t

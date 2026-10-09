@@ -1,10 +1,13 @@
 import React, { useState } from 'react';
 import { Icons } from '../ui/Icons';
 import { useApi } from '../../hooks/useApi';
-import { ApiKey, createApiKey, listApiKeys, revokeApiKey, setApiKeyAllowedOrigins } from '../../services/api';
+import { ApiKey, Tenant, User, createApiKey, listApiKeys, revokeApiKey, setApiKeyAllowedOrigins } from '../../services/api';
+import { TeamSection } from './TeamSection';
 import { formatRelative } from '../../services/timeRange';
 
 interface OverviewPageProps {
+  currentUser: User;
+  tenant: Tenant;
   onOpenDashboards: () => void;
 }
 
@@ -141,7 +144,9 @@ const AllowedOrigins: React.FC<{ apiKey: ApiKey; onSaved: () => void }> = ({ api
   );
 };
 
-export const OverviewPage: React.FC<OverviewPageProps> = ({ onOpenDashboards }) => {
+export const OverviewPage: React.FC<OverviewPageProps> = ({ currentUser, tenant, onOpenDashboards }) => {
+  // Key management is admin-only on the server; members just don't see the controls.
+  const isAdmin = currentUser.role === 'Admin';
   const { data: keys, loading, error, refetch } = useApi(() => listApiKeys(), []);
   const [showModal, setShowModal] = useState(false);
   const [revealed, setRevealed] = useState<Record<string, boolean>>({});
@@ -200,6 +205,7 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({ onOpenDashboards }) 
             <span>Dashboards</span>
           </button>
           <button
+            hidden={!isAdmin}
             onClick={() => setShowModal(true)}
             className="flex items-center gap-2 whitespace-nowrap bg-primary-600 hover:bg-primary-500 text-white px-4 py-2 rounded-md font-medium transition-colors shadow-lg shadow-primary-900/20"
           >
@@ -240,6 +246,7 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({ onOpenDashboards }) 
                     {key.environment}
                   </span>
                   <button
+                    hidden={!isAdmin}
                     onClick={() => handleRevoke(key)}
                     className="p-1.5 rounded text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
                     title="Revoke this key"
@@ -291,6 +298,7 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({ onOpenDashboards }) 
           ))}
 
           <button
+            hidden={!isAdmin}
             onClick={() => setShowModal(true)}
             className="border-2 border-dashed border-slate-300 dark:border-slate-800 rounded-xl flex flex-col items-center justify-center gap-3 text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 hover:border-slate-400 dark:hover:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-900/50 transition-all min-h-[200px] group"
           >
@@ -405,6 +413,8 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({ onOpenDashboards }) 
           </div>
         </>
       )}
+
+      <TeamSection currentUser={currentUser} tenant={tenant} />
     </div>
   );
 };

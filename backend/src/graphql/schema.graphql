@@ -19,6 +19,12 @@ enum AlertCondition {
   SlowPageLoad
 }
 
+enum UserRole {
+  User
+  "Manages API keys, alert rules and team membership."
+  Admin
+}
+
 enum AlertSeverity {
   Info
   Warning
@@ -49,6 +55,7 @@ type Tenant {
   domain: String!
   plan: String!
   isActive: Boolean!
+  maxUsers: Int!
 }
 
 type User {
@@ -56,13 +63,18 @@ type User {
   email: String!
   firstName: String!
   lastName: String!
-  role: String!
+  role: UserRole!
   tenantId: ID!
+  isActive: Boolean!
+  lastLoginAt: DateTime
 }
 
+"""
+A short-lived access token. The refresh token is set as an httpOnly cookie and
+is never exposed to page script.
+"""
 type AuthPayload {
   token: String!
-  refreshToken: String!
   user: User!
   tenant: Tenant!
 }
@@ -119,6 +131,50 @@ type ApiErrorPage {
   data: [ApiErrorLog!]!
 }
 
+"An endpoint whose successful responses the SDK reported as slow."
+type SlowRequestStat {
+  method: String!
+  "The request URL without its query string."
+  url: String!
+  count: Int!
+  avgDurationMs: Float!
+  maxDurationMs: Float!
+}
+
+type BusinessFlowStat {
+  flow: String!
+  total: Int!
+  completed: Int!
+  failed: Int!
+  timedOut: Int!
+  abandoned: Int!
+  avgDurationMs: Float!
+}
+
+"Totals for one event name sent with captureCustomEvent()."
+type CustomEventStat {
+  name: String!
+  count: Int!
+  "Distinct user ids set with setUser(); events without one are not counted."
+  users: Int!
+  lastSeen: DateTime!
+}
+
+"Summary of one numeric metric sent with captureMetric()."
+type CustomMetricStat {
+  name: String!
+  count: Int!
+  avg: Float!
+  min: Float!
+  max: Float!
+}
+
+type CustomMetricPoint {
+  timestamp: DateTime!
+  avg: Float!
+  count: Int!
+}
+
 type CustomEventLog {
   id: ID!
   eventName: String!
@@ -137,21 +193,12 @@ type CustomEventPage {
   data: [CustomEventLog!]!
 }
 
-type BusinessFlowStat {
-  flow: String!
-  total: Int!
-  completed: Int!
-  failed: Int!
-  timedOut: Int!
-  abandoned: Int!
-  avgDurationMs: Float!
-}
-
 type WebVitals {
   lcp: Float
   fcp: Float
   cls: Float
-  fid: Float
+  "Interaction to Next Paint, in ms."
+  inp: Float
   ttfb: Float
   sampleCount: Int!
 }
@@ -188,8 +235,11 @@ type PagePerformance {
 }
 
 type DashboardStats {
+  "Error occurrences in the window (hourly granularity)."
   totalErrors: Int!
+  "Errors + page views + API errors + custom events."
   totalEvents: Int!
+  pageViews: Int!
   avgLoadTime: Float!
   errorRate: Float!
   errorTrend: TrendData!
@@ -204,6 +254,7 @@ type PerformanceTimeSeriesPoint {
   avgTTFB: Float!
   avgLCP: Float!
   avgFCP: Float!
+  "Page views in the bucket."
   count: Int!
 }
 
@@ -303,84 +354,39 @@ input CreateApiKeyInput {
 
 input SaveLayoutInput {
   name: String!
-  isDefault: Boolean!
+  isDefault: Boolean = false
   configuration: JSON
 }
 
-input PerformanceMetricsInput {
-  lcp: Float
-  fcp: Float
-  cls: Float
-  fid: Float
-  ttfb: Float
-  dns: Float
-  tcp: Float
-  response: Float
-  dom: Float
-  load: Float
+input CreateUserInput {
+  email: String!
+  firstName: String!
+  lastName: String!
+  role: UserRole = User
+  "Handed to the new member out of band; they change it after signing in."
+  initialPassword: String!
 }
 
-input DeviceInfoInput {
-  type: String
-  browser: String
-  os: String
-  country: String
+input UpdateUserInput {
+  role: UserRole
+  isActive: Boolean
 }
 
-input IngestErrorInput {
-  type: String!
-  message: String!
-  stack: String
-  source: String
-  lineNo: Int
-  colNo: Int
-  url: String!
-  userAgent: String!
-  timestamp: Float!
-  metadata: JSON
+"The window to analyse; the metrics are read server-side from the tenant's own data."
+input AIAnalysisInput {
+  timeRange: String!
+  startDate: DateTime
+  endDate: DateTime
 }
 
-input IngestPerformanceInput {
-  url: String!
-  userAgent: String!
-  timestamp: Float!
-  metrics: PerformanceMetricsInput!
-  device: DeviceInfoInput
-}
-
-input IngestApiErrorInput {
-  type: String!
-  requestUrl: String!
-  method: String!
-  status: Int
-  message: String
-  url: String!
-  userAgent: String!
-  timestamp: Float!
-  requestHeaders: JSON
-  responseHeaders: JSON
-}
-
-input IngestCustomEventInput {
-  name: String!
-  url: String!
-  userAgent: String!
-  timestamp: Float!
-  data: JSON!
-  userId: String
-  sessionId: String
-}
-
-input BatchIngestInput {
-  errors: [IngestErrorInput!]
-  performance: [IngestPerformanceInput!]
-  apiErrors: [IngestApiErrorInput!]
-  customEvents: [IngestCustomEventInput!]
+type AIAnalysis {
+  summary: String!
+  recommendations: [String!]!
+  severity: String!
 }
 
 type Query {
-  me: User!
-  myTenant: Tenant!
+  users: [User!]!
   apiKeys: [ApiKey!]!
   dashboardStats(startDate: DateTime, endDate: DateTime): DashboardStats!
   errors(
@@ -392,7 +398,6 @@ type Query {
     startDate: DateTime
   ): ErrorPage!
   errorStatusCounts: ErrorStatusCounts!
-  errorDetails(id: ID!): ErrorLog!
   "Hourly occurrence counts for one error group, zero-filled."
   errorTimeSeries(errorHash: String!, hours: Int = 24): [ErrorTrendPoint!]!
   performanceTimeSeries(
@@ -404,10 +409,22 @@ type Query {
   "P75 of each Web Vital over the window."
   webVitals(startDate: DateTime, endDate: DateTime): WebVitals!
   deviceBreakdown(dimension: String = "browser", startDate: DateTime, endDate: DateTime): [BreakdownSlice!]!
+  "Failed requests only; slow successful requests are in slowRequests."
   apiErrors(page: Int = 1, pageSize: Int = 50, startDate: DateTime): ApiErrorPage!
-  customEvents(page: Int = 1, pageSize: Int = 50, name: String, startDate: DateTime): CustomEventPage!
+  slowRequests(startDate: DateTime, endDate: DateTime): [SlowRequestStat!]!
   "Completion/failure rates per business flow tracked with startFlow()."
   businessFlows(startDate: DateTime, endDate: DateTime): [BusinessFlowStat!]!
+  "Custom events per name, excluding the SDK's own metric and business_flow events."
+  customEventStats(startDate: DateTime, endDate: DateTime): [CustomEventStat!]!
+  customMetricStats(startDate: DateTime, endDate: DateTime): [CustomMetricStat!]!
+  customMetricTimeSeries(
+    metric: String!
+    startDate: DateTime
+    endDate: DateTime
+    interval: String = "hour"
+  ): [CustomMetricPoint!]!
+  "Recent occurrences, newest first. Without a name, excludes metric and business_flow events."
+  customEvents(page: Int = 1, pageSize: Int = 50, name: String, startDate: DateTime, endDate: DateTime): CustomEventPage!
   dashboardLayouts: [DashboardLayout!]!
   alertRules: [AlertRule!]!
   alertNotifications(page: Int = 1, pageSize: Int = 50, unreadOnly: Boolean = false): AlertNotificationPage!
@@ -416,12 +433,17 @@ type Query {
 type Mutation {
   register(input: RegisterInput!): AuthPayload!
   login(input: LoginInput!): AuthPayload!
-  "Exchanges a refresh token for a new session; the old token is rotated out."
-  refreshSession(refreshToken: String!): AuthPayload!
-  "Revokes the given refresh token, or every session for the user when omitted."
-  logout(refreshToken: String): Boolean!
-  changePassword(currentPassword: String!, newPassword: String!): Boolean!
+  "Exchanges the refresh cookie for a new session; the old token is rotated out."
+  refreshSession: AuthPayload!
+  "Ends this session, or every session of the user with everywhere: true."
+  logout(everywhere: Boolean = false): Boolean!
 
+  "Admin only."
+  createUser(input: CreateUserInput!): User!
+  "Admin only. Deactivating a user ends their sessions."
+  updateUser(id: ID!, input: UpdateUserInput!): User!
+
+  "Admin only, as are the other key and alert-rule mutations."
   createApiKey(input: CreateApiKeyInput!): ApiKey!
   revokeApiKey(id: ID!): ApiKey!
   "Restricts which origins may ingest with this key. An empty list means any origin."
@@ -436,11 +458,7 @@ type Mutation {
   updateErrorStatus(id: ID!, status: ErrorStatus!): ErrorLog!
 
   saveDashboardLayout(input: SaveLayoutInput!): DashboardLayout!
-  deleteDashboardLayout(id: ID!): Boolean!
 
-  ingestError(input: IngestErrorInput!): Boolean!
-  ingestPerformance(input: IngestPerformanceInput!): Boolean!
-  ingestApiError(input: IngestApiErrorInput!): Boolean!
-  ingestCustomEvent(input: IngestCustomEventInput!): Boolean!
-  ingestBatch(input: BatchIngestInput!): Boolean!
+  "Runs an AI analysis of the caller's own metrics for the window."
+  analyzeDashboardMetrics(input: AIAnalysisInput!): AIAnalysis!
 }

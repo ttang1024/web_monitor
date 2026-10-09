@@ -1,10 +1,9 @@
 // Thin GraphQL client for the monitoring API. No client library: the dashboard
 // issues a couple of dozen operations, all of them plain request/response.
 
-const API_URL = (process.env.API_URL as string | undefined) || 'http://localhost:4000/graphql';
+import type * as Schema from './generated/graphql';
 
-const TOKEN_KEY = 'monitoring.token';
-const REFRESH_KEY = 'monitoring.refreshToken';
+const API_URL = (process.env.API_URL as string | undefined) || 'http://localhost:4000/graphql';
 
 export class ApiError extends Error {
   code?: string;
@@ -18,20 +17,24 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * The access token lives only in memory: page script — and so any injected
+ * script — never sees a long-lived credential. The refresh token is an httpOnly
+ * cookie the API sets; after a reload the session is restored from it.
+ */
+let accessToken: string | null = null;
+let onExpired: (() => void) | null = null;
+
 export const session = {
   get token() {
-    return localStorage.getItem(TOKEN_KEY);
+    return accessToken;
   },
-  get refreshToken() {
-    return localStorage.getItem(REFRESH_KEY);
+  set(token: string | null) {
+    accessToken = token;
   },
-  save(token: string, refreshToken: string) {
-    localStorage.setItem(TOKEN_KEY, token);
-    localStorage.setItem(REFRESH_KEY, refreshToken);
-  },
-  clear() {
-    localStorage.removeItem(TOKEN_KEY);
-    localStorage.removeItem(REFRESH_KEY);
+  /** Called when the session is gone for good, so the app can return to the login screen. */
+  onExpired(handler: (() => void) | null) {
+    onExpired = handler;
   },
 };
 
@@ -47,6 +50,8 @@ async function post<T>(query: string, variables?: Variables, token?: string | nu
   try {
     response = await fetch(API_URL, {
       method: 'POST',
+      // The refresh cookie is scoped to the API's /graphql path.
+      credentials: 'include',
       headers: {
         'Content-Type': 'application/json',
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
@@ -70,215 +75,103 @@ async function post<T>(query: string, variables?: Variables, token?: string | nu
   return body.data;
 }
 
+const AUTH_FIELDS = `token user { id email firstName lastName role tenantId isActive lastLoginAt } tenant { id name domain plan isActive maxUsers }`;
+const REFRESH_MUTATION = `mutation Refresh { refreshSession { ${AUTH_FIELDS} } }`;
+
+let refreshInFlight: Promise<AuthPayload> | null = null;
+
 /**
- * Runs an authenticated operation. On an expired access token it rotates the
- * refresh token once and replays the request, so a 24h-old tab keeps working
- * instead of bouncing the user to the login screen.
+ * Exchanges the refresh cookie for a new access token.
+ *
+ * Every refresh rotates the cookie, so two refreshes racing with the same
+ * cookie would make the server see a reused token. Within a tab, concurrent
+ * callers share one request; across tabs, the Web Locks API serialises them so
+ * each tab presents the cookie the previous one was given.
+ */
+function refreshSession(): Promise<AuthPayload> {
+  if (!refreshInFlight) {
+    const run = async () => {
+      const data = await post<{ refreshSession: AuthPayload }>(REFRESH_MUTATION);
+      accessToken = data.refreshSession.token;
+      return data.refreshSession;
+    };
+    const locks = typeof navigator !== 'undefined' ? navigator.locks : undefined;
+    refreshInFlight = (locks ? locks.request('monitoring-session-refresh', run) : run()).finally(() => {
+      refreshInFlight = null;
+    });
+  }
+  return refreshInFlight;
+}
+
+/** Restores the session after a page load. Null when there is none to restore. */
+export async function restoreSession(): Promise<AuthPayload | null> {
+  try {
+    return await refreshSession();
+  } catch {
+    accessToken = null;
+    return null;
+  }
+}
+
+/**
+ * Runs an authenticated operation. Without a token, or on an expired one, it
+ * refreshes once and replays; if that fails too, the session is over.
  */
 async function authed<T>(query: string, variables?: Variables): Promise<T> {
+  const expire = (error: unknown): never => {
+    accessToken = null;
+    onExpired?.();
+    throw error;
+  };
+
+  if (!accessToken) await refreshSession().catch(expire);
+
   try {
-    return await post<T>(query, variables, session.token);
+    return await post<T>(query, variables, accessToken);
   } catch (error) {
-    const refreshToken = session.refreshToken;
-    if (!(error instanceof ApiError) || error.code !== 'UNAUTHENTICATED' || !refreshToken) throw error;
-
-    try {
-      const refreshed = await post<{ refreshSession: AuthPayload }>(REFRESH_MUTATION, { refreshToken });
-      session.save(refreshed.refreshSession.token, refreshed.refreshSession.refreshToken);
-    } catch {
-      session.clear();
-      throw error;
-    }
-
-    return post<T>(query, variables, session.token);
+    if (!(error instanceof ApiError) || error.code !== 'UNAUTHENTICATED') throw error;
+    await refreshSession().catch(() => expire(error));
+    return post<T>(query, variables, accessToken);
   }
 }
 
 // --- Types ------------------------------------------------------------------
+// Generated from the backend schema (npm run codegen). Where the dashboard
+// asks for fewer fields than the type has, the type is narrowed to match.
 
-export interface User {
-  id: string;
-  email: string;
-  firstName: string;
-  lastName: string;
-  role: string;
-  tenantId: string;
-}
-
-export interface Tenant {
-  id: string;
-  name: string;
-  domain: string;
-  plan: string;
-  isActive: boolean;
-}
-
-export interface AuthPayload {
-  token: string;
-  refreshToken: string;
-  user: User;
-  tenant: Tenant;
-}
-
-export interface ApiKey {
-  id: string;
-  name: string;
-  key: string;
-  environment: string;
-  isActive: boolean;
-  lastUsedAt: string | null;
-  /** Origins permitted to ingest with this key. Empty means any origin. */
-  allowedOrigins: string[];
-  createdAt: string;
-}
-
-export type AlertCondition = 'NewIssue' | 'ErrorSpike' | 'ErrorRate' | 'SlowPageLoad';
-export type AlertSeverity = 'Info' | 'Warning' | 'Critical';
-
-export interface AlertRule {
-  id: string;
-  name: string;
-  condition: AlertCondition;
-  threshold: number;
-  windowMinutes: number;
-  severity: AlertSeverity;
-  isEnabled: boolean;
-  cooldownMinutes: number;
-  lastTriggeredAt: string | null;
-  webhookUrl: string | null;
-  createdAt: string;
-}
-
-export interface AlertNotification {
-  id: string;
-  alertRuleId: string;
-  ruleName: string;
-  title: string;
-  body: string;
-  severity: AlertSeverity;
-  observedValue: number;
-  threshold: number;
-  errorHash: string | null;
-  isRead: boolean;
-  deliveredAt: string | null;
-  deliveryError: string | null;
-  createdAt: string;
-}
-
-export interface AlertNotificationPage {
-  total: number;
-  page: number;
-  pageSize: number;
-  unread: number;
-  data: AlertNotification[];
-}
-
-export interface AlertRuleInput {
-  name: string;
-  condition: AlertCondition;
-  threshold: number;
-  windowMinutes: number;
-  severity: AlertSeverity;
-  cooldownMinutes: number;
-  webhookUrl?: string | null;
-  isEnabled?: boolean;
-}
-
-export type ErrorStatus = 'Unresolved' | 'Resolved' | 'Ignored' | 'Regressed';
-
-export interface ErrorLog {
-  id: string;
-  type: string;
-  message: string;
-  stackTrace: string | null;
-  source: string | null;
-  lineNumber: number | null;
-  columnNumber: number | null;
-  url: string;
-  userAgent: string;
-  timestamp: number;
-  errorHash: string;
-  occurrenceCount: number;
-  status: ErrorStatus;
-  lastSeenAt: string;
-  metadata: Record<string, unknown> | null;
-  createdAt: string;
-}
-
-export interface ErrorPage {
-  total: number;
-  page: number;
-  pageSize: number;
-  data: ErrorLog[];
-}
-
-export interface ErrorStatusCounts {
-  unresolved: number;
-  resolved: number;
-  ignored: number;
-  regressed: number;
-}
-
-export interface ErrorTrendPoint {
-  bucketStart: string;
-  count: number;
-}
-
-export interface DashboardStats {
-  totalErrors: number;
-  totalEvents: number;
-  avgLoadTime: number;
-  errorRate: number;
-  errorTrend: { labels: string[]; values: number[] };
-  performanceTrend: { labels: string[]; values: number[] };
-  topErrors: { errorHash: string; type: string; message: string; count: number; lastSeen: string }[];
-  topSlowPages: { url: string; avgLoadTime: number; sampleCount: number }[];
-}
-
-export interface PerformancePoint {
-  timestamp: string;
-  avgLoadTime: number;
-  avgTTFB: number;
-  avgLCP: number;
-  avgFCP: number;
-  count: number;
-}
-
-export interface WebVitals {
-  lcp: number | null;
-  fcp: number | null;
-  cls: number | null;
-  fid: number | null;
-  ttfb: number | null;
-  sampleCount: number;
-}
-
-export interface BreakdownSlice {
-  name: string;
-  count: number;
-}
-
-export interface ApiErrorLog {
-  id: string;
-  type: string;
-  requestUrl: string;
-  method: string;
-  statusCode: number | null;
-  errorMessage: string | null;
-  pageUrl: string;
-  timestamp: number;
-  createdAt: string;
-}
-
-export interface BusinessFlowStat {
-  flow: string;
-  total: number;
-  completed: number;
-  failed: number;
-  timedOut: number;
-  abandoned: number;
-  avgDurationMs: number;
-}
+export type User = Schema.User;
+export type UserRole = Schema.UserRole;
+export type Tenant = Schema.Tenant;
+export type AuthPayload = Schema.AuthPayload;
+export type ApiKey = Omit<Schema.ApiKey, 'expiresAt'>;
+export type AlertCondition = Schema.AlertCondition;
+export type AlertSeverity = Schema.AlertSeverity;
+export type AlertRule = Omit<Schema.AlertRule, 'updatedAt'>;
+export type AlertNotification = Schema.AlertNotification;
+export type AlertNotificationPage = Schema.AlertNotificationPage;
+export type AlertRuleInput = Schema.AlertRuleInput;
+export type ErrorStatus = Schema.ErrorStatus;
+export type ErrorLog = Omit<Schema.ErrorLog, 'updatedAt'>;
+export type ErrorPage = Omit<Schema.ErrorPage, 'data'> & { data: ErrorLog[] };
+export type ErrorStatusCounts = Schema.ErrorStatusCounts;
+export type ErrorTrendPoint = Schema.ErrorTrendPoint;
+export type DashboardStats = Schema.DashboardStats;
+export type PerformancePoint = Schema.PerformanceTimeSeriesPoint;
+export type WebVitals = Schema.WebVitals;
+export type BreakdownSlice = Schema.BreakdownSlice;
+export type ApiErrorLog = Omit<Schema.ApiErrorLog, 'userAgent'>;
+export type AIAnalysisResult = Omit<Schema.AiAnalysis, 'severity'> & {
+  severity: 'low' | 'medium' | 'high' | 'critical';
+};
+export type BusinessFlowStat = Schema.BusinessFlowStat;
+export type SlowRequestStat = Schema.SlowRequestStat;
+export type CustomEventStat = Schema.CustomEventStat;
+export type CustomMetricStat = Schema.CustomMetricStat;
+export type CustomMetricPoint = Schema.CustomMetricPoint;
+export type CustomEventLog = Omit<Schema.CustomEventLog, 'sessionId'>;
+export type DashboardLayout = Schema.DashboardLayout;
+export type CreateUserInput = Schema.CreateUserInput;
+export type RegisterInput = Schema.RegisterInput;
 
 export interface DateRange {
   startDate?: string;
@@ -287,9 +180,7 @@ export interface DateRange {
 
 // --- Operations -------------------------------------------------------------
 
-const AUTH_FIELDS = `token refreshToken user { id email firstName lastName role tenantId } tenant { id name domain plan isActive }`;
-
-const REFRESH_MUTATION = `mutation Refresh($refreshToken: String!) { refreshSession(refreshToken: $refreshToken) { ${AUTH_FIELDS} } }`;
+const USER_FIELDS = `id email firstName lastName role tenantId isActive lastLoginAt`;
 
 const ERROR_FIELDS = `id type message stackTrace source lineNumber columnNumber url userAgent timestamp errorHash occurrenceCount status lastSeenAt metadata createdAt`;
 
@@ -300,17 +191,8 @@ export async function login(email: string, password: string): Promise<AuthPayloa
     `mutation Login($input: LoginInput!) { login(input: $input) { ${AUTH_FIELDS} } }`,
     { input: { email, password } }
   );
-  session.save(data.login.token, data.login.refreshToken);
+  accessToken = data.login.token;
   return data.login;
-}
-
-export interface RegisterInput {
-  email: string;
-  password: string;
-  firstName: string;
-  lastName: string;
-  tenantName: string;
-  domain: string;
 }
 
 export async function register(input: RegisterInput): Promise<AuthPayload> {
@@ -318,25 +200,18 @@ export async function register(input: RegisterInput): Promise<AuthPayload> {
     `mutation Register($input: RegisterInput!) { register(input: $input) { ${AUTH_FIELDS} } }`,
     { input }
   );
-  session.save(data.register.token, data.register.refreshToken);
+  accessToken = data.register.token;
   return data.register;
 }
 
 export async function logout(): Promise<void> {
-  const refreshToken = session.refreshToken;
   try {
-    await authed(`mutation Logout($refreshToken: String) { logout(refreshToken: $refreshToken) }`, { refreshToken });
+    // Sent with whatever token is at hand: the cookie identifies the session.
+    await post(`mutation Logout { logout }`, undefined, accessToken);
   } catch {
     // Logging out locally must succeed even if the API is unreachable.
   }
-  session.clear();
-}
-
-export async function me(): Promise<{ user: User; tenant: Tenant }> {
-  const data = await authed<{ me: User; myTenant: Tenant }>(
-    `query Me { me { id email firstName lastName role tenantId } myTenant { id name domain plan isActive } }`
-  );
-  return { user: data.me, tenant: data.myTenant };
+  accessToken = null;
 }
 
 export async function listApiKeys(): Promise<ApiKey[]> {
@@ -437,7 +312,7 @@ export async function dashboardStats(range: DateRange = {}): Promise<DashboardSt
   const data = await authed<{ dashboardStats: DashboardStats }>(
     `query Stats($startDate: DateTime, $endDate: DateTime) {
       dashboardStats(startDate: $startDate, endDate: $endDate) {
-        totalErrors totalEvents avgLoadTime errorRate
+        totalErrors totalEvents pageViews avgLoadTime errorRate
         errorTrend { labels values }
         performanceTrend { labels values }
         topErrors { errorHash type message count lastSeen }
@@ -508,7 +383,7 @@ export async function performanceTimeSeries(
 export async function webVitals(range: DateRange = {}): Promise<WebVitals> {
   const data = await authed<{ webVitals: WebVitals }>(
     `query Vitals($startDate: DateTime, $endDate: DateTime) {
-      webVitals(startDate: $startDate, endDate: $endDate) { lcp fcp cls fid ttfb sampleCount }
+      webVitals(startDate: $startDate, endDate: $endDate) { lcp fcp cls inp ttfb sampleCount }
     }`,
     range
   );
@@ -540,6 +415,33 @@ export async function listApiErrors(params: { page?: number; pageSize?: number; 
   return data.apiErrors;
 }
 
+// --- AI analysis --------------------------------------------------------------
+
+/** The server reads the metrics itself; only the window is sent. */
+export async function analyzeDashboard(input: {
+  timeRange: string;
+  startDate?: string;
+  endDate?: string;
+}): Promise<AIAnalysisResult> {
+  const data = await authed<{ analyzeDashboardMetrics: AIAnalysisResult }>(
+    `mutation AnalyzeDashboardMetrics($input: AIAnalysisInput!) {
+      analyzeDashboardMetrics(input: $input) { summary recommendations severity }
+    }`,
+    { input }
+  );
+  return data.analyzeDashboardMetrics;
+}
+
+export async function slowRequests(range: DateRange = {}): Promise<SlowRequestStat[]> {
+  const data = await authed<{ slowRequests: SlowRequestStat[] }>(
+    `query SlowRequests($startDate: DateTime, $endDate: DateTime) {
+      slowRequests(startDate: $startDate, endDate: $endDate) { method url count avgDurationMs maxDurationMs }
+    }`,
+    range
+  );
+  return data.slowRequests;
+}
+
 export async function businessFlows(range: DateRange = {}): Promise<BusinessFlowStat[]> {
   const data = await authed<{ businessFlows: BusinessFlowStat[] }>(
     `query Flows($startDate: DateTime, $endDate: DateTime) {
@@ -550,4 +452,93 @@ export async function businessFlows(range: DateRange = {}): Promise<BusinessFlow
     range
   );
   return data.businessFlows;
+}
+
+// --- Custom events and metrics ------------------------------------------------
+
+export async function customEventStats(range: DateRange = {}): Promise<CustomEventStat[]> {
+  const data = await authed<{ customEventStats: CustomEventStat[] }>(
+    `query EventStats($startDate: DateTime, $endDate: DateTime) {
+      customEventStats(startDate: $startDate, endDate: $endDate) { name count users lastSeen }
+    }`,
+    range
+  );
+  return data.customEventStats;
+}
+
+export async function customMetricStats(range: DateRange = {}): Promise<CustomMetricStat[]> {
+  const data = await authed<{ customMetricStats: CustomMetricStat[] }>(
+    `query MetricStats($startDate: DateTime, $endDate: DateTime) {
+      customMetricStats(startDate: $startDate, endDate: $endDate) { name count avg min max }
+    }`,
+    range
+  );
+  return data.customMetricStats;
+}
+
+export async function customMetricTimeSeries(
+  metric: string,
+  range: DateRange = {},
+  interval: 'hour' | 'day' = 'hour'
+): Promise<CustomMetricPoint[]> {
+  const data = await authed<{ customMetricTimeSeries: CustomMetricPoint[] }>(
+    `query MetricSeries($metric: String!, $startDate: DateTime, $endDate: DateTime, $interval: String) {
+      customMetricTimeSeries(metric: $metric, startDate: $startDate, endDate: $endDate, interval: $interval) {
+        timestamp avg count
+      }
+    }`,
+    { metric, ...range, interval }
+  );
+  return data.customMetricTimeSeries;
+}
+
+export async function listCustomEvents(params: { name?: string; page?: number; pageSize?: number } & DateRange = {}) {
+  const data = await authed<{ customEvents: { total: number; data: CustomEventLog[] } }>(
+    `query CustomEvents($name: String, $page: Int, $pageSize: Int, $startDate: DateTime, $endDate: DateTime) {
+      customEvents(name: $name, page: $page, pageSize: $pageSize, startDate: $startDate, endDate: $endDate) {
+        total data { id eventName url timestamp data userId createdAt }
+      }
+    }`,
+    params
+  );
+  return data.customEvents;
+}
+
+// --- Layouts ----------------------------------------------------------------
+
+export async function listLayouts(): Promise<DashboardLayout[]> {
+  const data = await authed<{ dashboardLayouts: DashboardLayout[] }>(
+    `query Layouts { dashboardLayouts { id userId name isDefault configuration createdAt updatedAt } }`
+  );
+  return data.dashboardLayouts;
+}
+
+export async function saveLayout(name: string, configuration: Record<string, unknown>, isDefault = true): Promise<void> {
+  await authed(
+    `mutation SaveLayout($input: SaveLayoutInput!) { saveDashboardLayout(input: $input) { id } }`,
+    { input: { name, configuration, isDefault } }
+  );
+}
+
+// --- Team -------------------------------------------------------------------
+
+export async function listUsers(): Promise<User[]> {
+  const data = await authed<{ users: User[] }>(`query Users { users { ${USER_FIELDS} } }`);
+  return data.users;
+}
+
+export async function createUser(input: CreateUserInput): Promise<User> {
+  const data = await authed<{ createUser: User }>(
+    `mutation CreateUser($input: CreateUserInput!) { createUser(input: $input) { ${USER_FIELDS} } }`,
+    { input }
+  );
+  return data.createUser;
+}
+
+export async function updateUser(id: string, input: { role?: UserRole; isActive?: boolean }): Promise<User> {
+  const data = await authed<{ updateUser: User }>(
+    `mutation UpdateUser($id: ID!, $input: UpdateUserInput!) { updateUser(id: $id, input: $input) { ${USER_FIELDS} } }`,
+    { id, input }
+  );
+  return data.updateUser;
 }

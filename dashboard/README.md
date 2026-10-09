@@ -15,6 +15,8 @@ View your app in AI Studio: https://ai.studio/apps/drive/10ryjC5EMpX8n61bMdSlWJF
 
 1. Install dependencies:
    `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
+2. Copy `.env.example` to `.env.local` and set `API_URL` to the backend's GraphQL endpoint.
+   The AI Insights panel's `GEMINI_API_KEY` is configured on the backend, not here — see
+   `backend/.env.example`.
 3. Run the app:
    `npm run dev`

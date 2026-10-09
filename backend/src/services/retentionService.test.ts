@@ -11,6 +11,7 @@ const prismaMock = {
   errorBucket: table(),
   alertNotification: table(),
   refreshToken: { deleteMany: vi.fn().mockResolvedValue({ count: 0 }) },
+  ingestBatch: { deleteMany: vi.fn().mockResolvedValue({ count: 0 }) },
   errorLog: table(),
 }
 
@@ -45,11 +46,20 @@ describe('pruneExpiredData', () => {
     )
   })
 
-  // ErrorLog is the tenant's issue list with triage status attached, not raw
-  // event data — deleting it would silently reopen every resolved issue.
-  it('leaves ErrorLog alone', async () => {
+  // ErrorLog is the issue list: an issue goes only once it has stopped
+  // recurring, and never while someone has chosen to ignore it.
+  it('prunes issues that have not recurred within the window, except ignored ones', async () => {
+    const summary = await pruneExpiredData(NOW)
+    expect(prismaMock.errorLog.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { lastSeenAt: { lt: summary.cutoff }, status: { not: 'Ignored' } } })
+    )
+  })
+
+  it('expires ingest idempotency keys after a day', async () => {
     await pruneExpiredData(NOW)
-    expect(prismaMock.errorLog.deleteMany).not.toHaveBeenCalled()
+    expect(prismaMock.ingestBatch.deleteMany).toHaveBeenCalledWith({
+      where: { createdAt: { lt: new Date('2026-08-03T12:00:00.000Z') } },
+    })
   })
 
   it('removes refresh tokens that expired, regardless of the retention window', async () => {

@@ -10,13 +10,12 @@ RUN npm ci
 
 COPY . .
 
-# Vite inlines these at build time via `define`, so they are baked into the
-# bundle rather than read at container start — the image is environment-
-# specific, and a different API_URL needs a different build.
+# Vite inlines this at build time via `define`, so it is baked into the bundle
+# rather than read at container start — the image is environment-specific, and
+# a different API_URL needs a different build. No secret belongs here: this
+# ARG/ENV pair ends up readable by anyone who loads the built dashboard.
 ARG API_URL=http://localhost:4000/graphql
-ARG GEMINI_API_KEY=
 ENV API_URL=$API_URL
-ENV GEMINI_API_KEY=$GEMINI_API_KEY
 
 RUN npm run build
 
@@ -25,6 +24,7 @@ FROM nginx:1.27-alpine AS runtime
 
 COPY --from=build /app/dist /usr/share/nginx/html
 COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY security-headers.conf /etc/nginx/security-headers.conf
 
 EXPOSE 80
 

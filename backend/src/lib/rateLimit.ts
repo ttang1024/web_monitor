@@ -1,54 +1,42 @@
+import type { Redis } from 'ioredis'
 import { env } from './env.js'
 import { RateLimitedError } from './errors.js'
+import { getRedis } from './redis.js'
 
-interface Window {
+interface WindowState {
   count: number
   resetAt: number
 }
 
-/**
- * Fixed-window limiter kept in process memory. Enough to stop credential
- * stuffing against a single instance; a multi-instance deployment should back
- * this with Redis (the interface is intentionally small enough to swap).
- */
-export class RateLimiter {
-  private windows = new Map<string, Window>()
+/** Fixed-window counter storage. `incr` adds `cost` and returns the window after it. */
+export interface RateLimitStore {
+  incr(key: string, cost: number, windowMs: number, now: number): Promise<WindowState>
+  reset(key: string): Promise<void>
+}
 
-  constructor(
-    private readonly limit: number,
-    private readonly windowMs: number,
-    private readonly maxKeys = 10_000
-  ) {}
+/** Per-process store. Correct for one instance; each instance counts separately otherwise. */
+export class MemoryRateLimitStore implements RateLimitStore {
+  private windows = new Map<string, WindowState>()
 
-  /**
-   * Charges `cost` against `key`; throws RateLimitedError once the window is
-   * exhausted. `cost` is 1 for "one attempt" limiters and the event count for
-   * ingestion, where a single request can carry hundreds of events and
-   * counting requests would measure the wrong thing.
-   */
-  hit(key: string, now = Date.now(), cost = 1): void {
+  constructor(private readonly maxKeys = 10_000) {}
+
+  async incr(key: string, cost: number, windowMs: number, now: number): Promise<WindowState> {
+    return this.incrSync(key, cost, windowMs, now)
+  }
+
+  incrSync(key: string, cost: number, windowMs: number, now: number): WindowState {
     const window = this.windows.get(key)
-
     if (!window || window.resetAt <= now) {
       if (this.windows.size >= this.maxKeys) this.prune(now)
-      this.windows.set(key, { count: cost, resetAt: now + this.windowMs })
-      // A single oversized charge still has to be rejected, or a caller could
-      // exceed the limit whenever its charge happens to open a fresh window.
-      if (cost > this.limit) this.reject(now + this.windowMs, now)
-      return
+      const fresh = { count: cost, resetAt: now + windowMs }
+      this.windows.set(key, fresh)
+      return { ...fresh }
     }
-
     window.count += cost
-    if (window.count > this.limit) this.reject(window.resetAt, now)
+    return { ...window }
   }
 
-  private reject(resetAt: number, now: number): never {
-    const retryAfterSeconds = Math.ceil((resetAt - now) / 1000)
-    throw new RateLimitedError(`Too many attempts. Try again in ${retryAfterSeconds}s.`, this.limit)
-  }
-
-  /** Called after a successful attempt so honest users aren't penalised. */
-  reset(key: string): void {
+  async reset(key: string): Promise<void> {
     this.windows.delete(key)
   }
 
@@ -68,9 +56,89 @@ export class RateLimiter {
   }
 }
 
-// 10 attempts per IP+identity every 15 minutes.
-export const authRateLimiter = new RateLimiter(10, 15 * 60 * 1000)
+// INCRBY and the expiry are set atomically, so two instances can't both see a
+// "new" window and each start their own.
+const INCR_SCRIPT = `
+local count = redis.call('INCRBY', KEYS[1], ARGV[1])
+if count == tonumber(ARGV[1]) then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
+local ttl = redis.call('PTTL', KEYS[1])
+return {count, ttl}
+`
 
-// Events per minute per API key. Sized from env because the right ceiling
-// depends on how much traffic the installed pages actually carry.
-export const ingestRateLimiter = new RateLimiter(env.INGEST_EVENTS_PER_MINUTE, 60 * 1000)
+/**
+ * Shared store, so every API instance draws from the same budget. If Redis is
+ * unreachable it falls back to the in-process store rather than either
+ * blocking all traffic or switching limiting off.
+ */
+export class RedisRateLimitStore implements RateLimitStore {
+  private readonly fallback = new MemoryRateLimitStore()
+
+  constructor(
+    private readonly redis: Redis,
+    private readonly prefix: string
+  ) {}
+
+  async incr(key: string, cost: number, windowMs: number, now: number): Promise<WindowState> {
+    try {
+      const [count, ttl] = (await this.redis.eval(INCR_SCRIPT, 1, this.prefix + key, cost, windowMs)) as [
+        number,
+        number,
+      ]
+      return { count, resetAt: now + (ttl > 0 ? ttl : windowMs) }
+    } catch {
+      return this.fallback.incr(key, cost, windowMs, now)
+    }
+  }
+
+  async reset(key: string): Promise<void> {
+    await this.redis.del(this.prefix + key).catch(() => {})
+    await this.fallback.reset(key)
+  }
+}
+
+export class RateLimiter {
+  constructor(
+    private readonly limit: number,
+    private readonly windowMs: number,
+    private readonly store: RateLimitStore = new MemoryRateLimitStore()
+  ) {}
+
+  /**
+   * Charges `cost` against `key`; throws RateLimitedError once the window is
+   * exhausted. `cost` is 1 for "one attempt" limiters and the event count for
+   * ingestion, where one request can carry hundreds of events.
+   */
+  async hit(key: string, cost = 1, now = Date.now()): Promise<void> {
+    const window = await this.store.incr(key, cost, this.windowMs, now)
+    if (window.count > this.limit) {
+      const retryAfterSeconds = Math.max(1, Math.ceil((window.resetAt - now) / 1000))
+      throw new RateLimitedError(
+        `Too many attempts. Try again in ${retryAfterSeconds}s.`,
+        this.limit,
+        retryAfterSeconds
+      )
+    }
+  }
+
+  /** Called after a successful attempt so honest users aren't penalised. */
+  async reset(key: string): Promise<void> {
+    await this.store.reset(key)
+  }
+}
+
+function storeFor(name: string): RateLimitStore {
+  const redis = getRedis()
+  return redis ? new RedisRateLimitStore(redis, `ratelimit:${name}:`) : new MemoryRateLimitStore()
+}
+
+// 10 attempts per IP+identity every 15 minutes.
+export const authRateLimiter = new RateLimiter(10, 15 * 60 * 1000, storeFor('auth'))
+
+// Events per minute per API key.
+export const ingestRateLimiter = new RateLimiter(env.INGEST_EVENTS_PER_MINUTE, 60 * 1000, storeFor('ingest'))
+
+// AI analysis calls a paid third-party model per request: a cost bound per tenant.
+export const aiAnalysisRateLimiter = new RateLimiter(20, 60 * 60 * 1000, storeFor('ai'))
+
+// Session refreshes per IP. Looser than login: every open tab refreshes on its own.
+export const refreshRateLimiter = new RateLimiter(60, 15 * 60 * 1000, storeFor('refresh'))

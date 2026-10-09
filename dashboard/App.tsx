@@ -6,13 +6,23 @@ import { AddWidgetModal } from './components/Dashboard/AddWidgetModal';
 import { CustomTimeRangePicker } from './components/Dashboard/CustomTimeRangeModal';
 import { IssuesPage } from './components/Pages/IssuesPage';
 import { PerformancePage } from './components/Pages/PerformancePage';
-import { ReplaysPage } from './components/Pages/ReplaysPage';
+import { EventsPage } from './components/Pages/EventsPage';
 import { AlertsPage } from './components/Pages/AlertsPage';
 import { OverviewPage } from './components/Pages/OverviewPage';
 import { AuthPage } from './components/Pages/AuthPage';
-import { DashboardState, WidgetConfig, TimeRange, Environment, ChartType, MetricType, Page, CustomTimeRange } from './types';
+import { DashboardState, WidgetConfig, TimeRange, ChartType, MetricType, Page, CustomTimeRange } from './types';
 import { INITIAL_WIDGETS } from './constants';
-import { AuthPayload, Tenant, User, logout as apiLogout, dashboardStats, me, session } from './services/api';
+import {
+  AuthPayload,
+  Tenant,
+  User,
+  dashboardStats,
+  listLayouts,
+  logout as apiLogout,
+  restoreSession,
+  saveLayout,
+  session,
+} from './services/api';
 import { useApi } from './hooks/useApi';
 import { toDateRange } from './services/timeRange';
 
@@ -24,6 +34,8 @@ const SUMMARY_PLACEHOLDERS = [
   { label: 'Avg Load Time', value: '—', status: 'neutral' as const, trend: 'loading' },
   { label: 'Slowest Page', value: '—', status: 'neutral' as const, trend: 'loading' },
 ];
+
+const LAYOUT_NAME = 'Default Dashboard';
 
 const App: React.FC = () => {
   // Auth State — a stored token is verified against the API before we render
@@ -41,7 +53,6 @@ const App: React.FC = () => {
   const [dashboardState, setDashboardState] = useState<DashboardState>({
     widgets: INITIAL_WIDGETS,
     timeRange: '24h',
-    environment: 'production',
     isEditMode: false,
   });
 
@@ -52,16 +63,43 @@ const App: React.FC = () => {
   const [showAddWidgetModal, setShowAddWidgetModal] = useState(false);
   const [showCustomTimePicker, setShowCustomTimePicker] = useState(false);
 
+  // The session is restored from the httpOnly refresh cookie; nothing about
+  // it is kept in localStorage.
   useEffect(() => {
-    if (!session.token) {
-      setBootstrapping(false);
+    restoreSession()
+      .then((payload) => payload && setAccount({ user: payload.user, tenant: payload.tenant }))
+      .finally(() => setBootstrapping(false));
+    session.onExpired(() => setAccount(null));
+    return () => session.onExpired(null);
+  }, []);
+
+  // Widget layout is per user and saved server-side, so it follows them across
+  // browsers. Loaded once after sign-in; saved (debounced) on every change.
+  const [layoutLoaded, setLayoutLoaded] = useState(false);
+  useEffect(() => {
+    if (!account) {
+      setLayoutLoaded(false);
       return;
     }
-    me()
-      .then(setAccount)
-      .catch(() => session.clear())
-      .finally(() => setBootstrapping(false));
-  }, []);
+    listLayouts()
+      .then((layouts) => {
+        const saved = (layouts.find((layout) => layout.isDefault) ?? layouts[0])?.configuration;
+        const widgets = (saved as { widgets?: WidgetConfig[] } | null)?.widgets;
+        if (Array.isArray(widgets) && widgets.length > 0) setDashboardState((s) => ({ ...s, widgets }));
+      })
+      .catch(() => {
+        // Keep the default layout; saving will still work.
+      })
+      .finally(() => setLayoutLoaded(true));
+  }, [account]);
+
+  useEffect(() => {
+    if (!layoutLoaded) return;
+    const timer = setTimeout(() => {
+      saveLayout(LAYOUT_NAME, { widgets: dashboardState.widgets }).catch(() => {});
+    }, 1000);
+    return () => clearTimeout(timer);
+  }, [dashboardState.widgets, layoutLoaded]);
 
   const range = useMemo(
     () => toDateRange(dashboardState.timeRange, dashboardState.customTimeRange),
@@ -269,7 +307,7 @@ const App: React.FC = () => {
           {/* Navigation - Hidden on Overview */}
           {activePage !== 'overview' && (
             <nav className="hidden md:flex items-center gap-1">
-              {['Dashboard', 'Issues', 'Performance', 'Replays', 'Alerts'].map((item) => {
+              {['Dashboard', 'Issues', 'Performance', 'Events', 'Alerts'].map((item) => {
                 const pageKey = item.toLowerCase() as Page;
                 const isActive = activePage === pageKey;
                 return (
@@ -332,21 +370,6 @@ const App: React.FC = () => {
                 )}
               </div>
 
-              <div className="h-6 w-px bg-slate-200 dark:bg-slate-800"></div>
-
-              <div className="flex items-center gap-2">
-                <div className={`w-2 h-2 rounded-full ${dashboardState.environment === 'production' ? 'bg-green-500' : 'bg-yellow-500'}`}></div>
-                <select 
-                  className="bg-transparent text-sm text-slate-600 dark:text-slate-300 font-medium focus:outline-none cursor-pointer"
-                  value={dashboardState.environment}
-                  onChange={(e) => setDashboardState(s => ({ ...s, environment: e.target.value as Environment }))}
-                >
-                  <option value="production">Production</option>
-                  <option value="staging">Staging</option>
-                  <option value="development">Local/Dev</option>
-                </select>
-              </div>
-
                <button 
                 className="ml-2 text-slate-500 dark:text-slate-400 hover:text-primary-600 dark:hover:text-white bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 p-2 rounded-full transition-all"
                 onClick={() => setShowAI(true)}
@@ -382,7 +405,7 @@ const App: React.FC = () => {
         <div className="max-w-[1600px] mx-auto w-full">
           
           {activePage === 'overview' ? (
-             <OverviewPage onOpenDashboards={() => setActivePage('dashboard')} />
+             <OverviewPage currentUser={account!.user} tenant={account!.tenant} onOpenDashboards={() => setActivePage('dashboard')} />
           ) : (
             <>
               {(
@@ -490,7 +513,7 @@ const App: React.FC = () => {
                   {/* Sub Pages */}
                   {activePage === 'issues' && <IssuesPage timeRange={dashboardState.timeRange} range={range} theme={theme} />}
                   {activePage === 'performance' && <PerformancePage timeRange={dashboardState.timeRange} range={range} theme={theme} />}
-                  {activePage === 'replays' && <ReplaysPage theme={theme} />}
+                  {activePage === 'events' && <EventsPage timeRange={dashboardState.timeRange} range={range} theme={theme} />}
                   {activePage === 'alerts' && <AlertsPage />}
                 </div>
               )}
@@ -500,26 +523,8 @@ const App: React.FC = () => {
         </div>
       </main>
 
-      {/* AI Panel — analyses the metrics actually on screen */}
-      {showAI && (
-        <AIAnalysisPanel
-          dashboardState={dashboardState}
-          metricsSummary={JSON.stringify(
-            stats.data
-              ? {
-                  window: { start: range.startDate, end: range.endDate },
-                  totalEvents: stats.data.totalEvents,
-                  totalErrors: stats.data.totalErrors,
-                  errorRatePercent: stats.data.errorRate,
-                  avgLoadTimeMs: stats.data.avgLoadTime,
-                  topErrors: stats.data.topErrors.map((e) => ({ message: e.message, count: e.count })),
-                  slowestPages: stats.data.topSlowPages.map((p) => ({ url: p.url, avgLoadTimeMs: p.avgLoadTime })),
-                }
-              : { note: 'No metrics loaded yet' }
-          )}
-          onClose={() => setShowAI(false)}
-        />
-      )}
+      {/* AI Panel — the server analyses the tenant's metrics for the window on screen */}
+      {showAI && <AIAnalysisPanel dashboardState={dashboardState} range={range} onClose={() => setShowAI(false)} />}
 
       {/* Add Widget Modal */}
       {showAddWidgetModal && (

@@ -8,13 +8,13 @@ interface AddWidgetModalProps {
 }
 
 const METRIC_OPTIONS = [
-  { value: MetricType.ErrorRate, label: 'Error Rate', description: 'Track exceptions over time' },
+  { value: MetricType.ErrorCount, label: 'Errors', description: 'Error occurrences over time' },
   { value: MetricType.PageLoad, label: 'Page Load Time', description: 'Avg time to full load' },
-  { value: MetricType.ApiLatency, label: 'API Latency', description: 'Response time (P95)' },
-  { value: MetricType.ApiFailure, label: 'API Failure Rate', description: 'Failed requests %' },
-  { value: MetricType.UserSessions, label: 'User Sessions', description: 'Active users count' },
-  { value: MetricType.JsHeap, label: 'JS Heap Size', description: 'Memory usage' },
+  { value: MetricType.PageViews, label: 'Page Views', description: 'Pages loaded per interval' },
+  { value: MetricType.ApiFailures, label: 'API Failures', description: 'Failed requests over time' },
+  { value: MetricType.BrowserMix, label: 'Browser Mix', description: 'Page views by browser' },
   { value: MetricType.LCP, label: 'LCP (Core Web Vital)', description: 'Largest Contentful Paint' },
+  { value: MetricType.FCP, label: 'FCP', description: 'First Contentful Paint' },
 ];
 
 const CHART_OPTIONS = [
@@ -26,7 +26,7 @@ const CHART_OPTIONS = [
 
 export const AddWidgetModal: React.FC<AddWidgetModalProps> = ({ onClose, onAdd }) => {
   const [title, setTitle] = useState('');
-  const [metric, setMetric] = useState<MetricType>(MetricType.ErrorRate);
+  const [metric, setMetric] = useState<MetricType>(MetricType.ErrorCount);
   const [chartType, setChartType] = useState<ChartType>(ChartType.Line);
   const [width, setWidth] = useState(2);
 

@@ -21,7 +21,7 @@ export interface ApiKeyDto {
   createdAt: Date
 }
 
-export function toApiKeyDto(apiKey: ApiKey): ApiKeyDto {
+function toApiKeyDto(apiKey: ApiKey): ApiKeyDto {
   return {
     id: apiKey.id,
     name: apiKey.name,

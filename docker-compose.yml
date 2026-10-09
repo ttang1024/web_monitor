@@ -9,17 +9,33 @@ services:
     image: mysql:8
     restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-yourpassword}
+      # No default passwords: Compose refuses to start until they are set.
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD must be set}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-monitoring_saas}
+      # The API connects as this user, which the image grants rights on
+      # MYSQL_DATABASE only — never as root.
+      MYSQL_USER: ${MYSQL_USER:-monitoring}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD must be set}
     volumes:
       - monitoring-mysql-data:/var/lib/mysql
     healthcheck:
       # The API's migration step fails outright against a database that is still
       # starting, so nothing else may start until this passes.
-      test: ['CMD', 'mysqladmin', 'ping', '-h', 'localhost', '-uroot', '-p${MYSQL_ROOT_PASSWORD:-yourpassword}']
+      test: ['CMD-SHELL', 'mysqladmin ping -h localhost -uroot -p"$$MYSQL_ROOT_PASSWORD"']
       interval: 10s
       timeout: 5s
       retries: 10
+
+  # Shared rate-limit state, so limits hold across API replicas.
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ['redis-server', '--save', '', '--appendonly', 'no']
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
   api:
     build:
@@ -28,16 +44,27 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
-      DATABASE_URL: mysql://root:${MYSQL_ROOT_PASSWORD:-yourpassword}@mysql:3306/${MYSQL_DATABASE:-monitoring_saas}
+      DATABASE_URL: mysql://${MYSQL_USER:-monitoring}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-monitoring_saas}
+      REDIS_URL: redis://redis:6379
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set and at least 32 characters}
       JWT_ISSUER: ${JWT_ISSUER:-MonitoringSaaS}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-MonitoringSaasUsers}
       NODE_ENV: production
       PORT: 4000
+      # Dashboard origin(s) for /graphql. Ingestion (/ingest) accepts any origin.
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:8080}
+      # Number of reverse proxies in front of the API (0 when exposed directly).
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+      # "none" (HTTPS only) if the dashboard and API are on different sites.
+      REFRESH_COOKIE_SAMESITE: ${REFRESH_COOKIE_SAMESITE:-lax}
       RETENTION_DAYS: ${RETENTION_DAYS:-90}
       ALERTS_ENABLED: ${ALERTS_ENABLED:-true}
+      # Optional: powers the dashboard's "AI Insights" panel. Held here, not on
+      # the dashboard service, so the key never reaches a browser.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
     ports:
       - '4000:4000'
     # Migrations run at start rather than in the image build, which has no
@@ -50,7 +77,6 @@ services:
       args:
         # Baked into the bundle at build time, so changing this needs a rebuild.
         API_URL: ${DASHBOARD_API_URL:-http://localhost:4000/graphql}
-        GEMINI_API_KEY: ${GEMINI_API_KEY:-}
     restart: unless-stopped
     depends_on:
       - api

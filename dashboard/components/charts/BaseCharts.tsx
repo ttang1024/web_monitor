@@ -15,7 +15,7 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from 'recharts';
-import { MOCK_COLORS } from '../../constants';
+import { CHART_COLORS } from '../../constants';
 
 interface ChartProps {
   // Recharts reads series values off arbitrary keys, so the row shape is
@@ -46,11 +46,11 @@ const CustomTooltip = ({ active, payload, label }: TooltipProps) => {
 };
 
 const getChartColors = (theme: 'light' | 'dark' = 'dark') => ({
-  grid: theme === 'dark' ? MOCK_COLORS.grid : '#e2e8f0', // slate-200 for light
-  axis: theme === 'dark' ? MOCK_COLORS.neutral : '#64748b', // slate-500 for light
+  grid: theme === 'dark' ? CHART_COLORS.grid : '#e2e8f0', // slate-200 for light
+  axis: theme === 'dark' ? CHART_COLORS.neutral : '#64748b', // slate-500 for light
 });
 
-export const SimpleLineChart: React.FC<ChartProps> = ({ data, color = MOCK_COLORS.primary, theme }) => {
+export const SimpleLineChart: React.FC<ChartProps> = ({ data, color = CHART_COLORS.primary, theme }) => {
   const colors = getChartColors(theme);
   return (
     <ResponsiveContainer width="100%" height="100%">
@@ -84,7 +84,7 @@ export const SimpleLineChart: React.FC<ChartProps> = ({ data, color = MOCK_COLOR
   );
 };
 
-export const SparkLineChart: React.FC<ChartProps> = ({ data, color = MOCK_COLORS.primary, theme }) => {
+export const SparkLineChart: React.FC<ChartProps> = ({ data, color = CHART_COLORS.primary, theme }) => {
   const colors = getChartColors(theme);
   return (
     <ResponsiveContainer width="100%" height="100%">
@@ -103,7 +103,7 @@ export const SparkLineChart: React.FC<ChartProps> = ({ data, color = MOCK_COLORS
   );
 };
 
-export const SimpleAreaChart: React.FC<ChartProps> = ({ data, color = MOCK_COLORS.primary, theme }) => {
+export const SimpleAreaChart: React.FC<ChartProps> = ({ data, color = CHART_COLORS.primary, theme }) => {
   const colors = getChartColors(theme);
   return (
     <ResponsiveContainer width="100%" height="100%">
@@ -142,7 +142,7 @@ export const SimpleAreaChart: React.FC<ChartProps> = ({ data, color = MOCK_COLOR
   );
 };
 
-export const SimpleBarChart: React.FC<ChartProps> = ({ data, color = MOCK_COLORS.primary, theme }) => {
+export const SimpleBarChart: React.FC<ChartProps> = ({ data, color = CHART_COLORS.primary, theme }) => {
   const colors = getChartColors(theme);
   return (
     <ResponsiveContainer width="100%" height="100%">
@@ -166,7 +166,7 @@ export const SimpleBarChart: React.FC<ChartProps> = ({ data, color = MOCK_COLORS
 };
 
 export const SimplePieChart: React.FC<ChartProps> = ({ data }) => {
-  const COLORS = [MOCK_COLORS.primary, MOCK_COLORS.secondary, MOCK_COLORS.success, MOCK_COLORS.warning];
+  const COLORS = [CHART_COLORS.primary, CHART_COLORS.secondary, CHART_COLORS.success, CHART_COLORS.warning];
 
   return (
     <ResponsiveContainer width="100%" height="100%">
@@ -180,7 +180,7 @@ export const SimplePieChart: React.FC<ChartProps> = ({ data }) => {
           paddingAngle={5}
           dataKey="value"
         >
-          {data.map((entry, index) => (
+          {data.map((_, index) => (
             <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} stroke="rgba(0,0,0,0)" />
           ))}
         </Pie>

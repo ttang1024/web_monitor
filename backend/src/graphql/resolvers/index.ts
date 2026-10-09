@@ -1,9 +1,9 @@
 import { DateTimeResolver, JSONResolver } from 'graphql-scalars'
+import { aiAnalysisResolvers } from './aiAnalysis.js'
 import { alertResolvers } from './alerts.js'
 import { apiKeyResolvers } from './apiKey.js'
 import { authResolvers } from './auth.js'
 import { dashboardResolvers } from './dashboard.js'
-import { sdkResolvers } from './sdk.js'
 
 export const resolvers = {
   DateTime: DateTimeResolver,
@@ -30,7 +30,7 @@ export const resolvers = {
     ...authResolvers.Mutation,
     ...apiKeyResolvers.Mutation,
     ...dashboardResolvers.Mutation,
-    ...sdkResolvers.Mutation,
     ...alertResolvers.Mutation,
+    ...aiAnalysisResolvers.Mutation,
   },
 }

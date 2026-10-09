@@ -10,10 +10,8 @@ export default defineConfig({
     globals: true,
   },
   define: {
-    // api.ts reads these at module scope, exactly as the Vite build inlines
-    // them. Without them the import throws before any test runs.
+    // api.ts reads this at module scope, exactly as the Vite build inlines it.
+    // Without it the import throws before any test runs.
     'process.env.API_URL': JSON.stringify('http://localhost:4000/graphql'),
-    'process.env.GEMINI_API_KEY': JSON.stringify(''),
-    'process.env.API_KEY': JSON.stringify(''),
   },
 });

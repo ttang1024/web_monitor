@@ -1,40 +1,32 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, listApiKeys, login, session } from './api';
+import { ApiError, listApiKeys, login, logout, restoreSession, session } from './api';
 
 /** One GraphQL HTTP response. */
 function gql(body: unknown, status = 200) {
   return { ok: status < 400, status, json: () => Promise.resolve(body) };
 }
 
+const unauthenticated = (message = 'Authentication required') =>
+  gql({ errors: [{ message, extensions: { code: 'UNAUTHENTICATED' } }] });
+
+const refreshed = (token: string) => gql({ data: { refreshSession: { token, user: {}, tenant: {} } } });
+
 const fetchMock = vi.fn();
 
 beforeEach(() => {
   vi.stubGlobal('fetch', fetchMock);
   fetchMock.mockReset();
-  localStorage.clear();
+  session.set(null);
+  session.onExpired(null);
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe('session', () => {
-  it('round-trips and clears both tokens', () => {
-    session.save('access-1', 'refresh-1');
-    expect(session.token).toBe('access-1');
-    expect(session.refreshToken).toBe('refresh-1');
-
-    session.clear();
-    expect(session.token).toBeNull();
-    expect(session.refreshToken).toBeNull();
-  });
-});
-
 describe('error handling', () => {
   it('surfaces a GraphQL error as an ApiError carrying its code', async () => {
-    fetchMock.mockResolvedValueOnce(
-      gql({ errors: [{ message: 'Invalid credentials', extensions: { code: 'UNAUTHENTICATED' } }] })
-    );
+    fetchMock.mockResolvedValueOnce(unauthenticated('Invalid credentials'));
 
     await expect(login('a@b.com', 'wrong')).rejects.toMatchObject({
       name: 'ApiError',
@@ -55,13 +47,9 @@ describe('error handling', () => {
       })
     );
 
-    await expect(login('nope', 'x')).rejects.toMatchObject({
-      fields: { email: ['Invalid email address'] },
-    });
+    await expect(login('nope', 'x')).rejects.toMatchObject({ fields: { email: ['Invalid email address'] } });
   });
 
-  // A backend that isn't running is the single most common failure while
-  // developing, and it deserves a better message than "fetch failed".
   it('explains an unreachable API rather than leaking the fetch error', async () => {
     fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'));
 
@@ -72,75 +60,95 @@ describe('error handling', () => {
   });
 });
 
-describe('login', () => {
-  it('stores the tokens it receives', async () => {
-    fetchMock.mockResolvedValueOnce(
-      gql({ data: { login: { token: 'access-1', refreshToken: 'refresh-1', user: {}, tenant: {} } } })
-    );
+describe('session storage', () => {
+  it('keeps the access token in memory only, never in localStorage', async () => {
+    fetchMock.mockResolvedValueOnce(gql({ data: { login: { token: 'access-1', user: {}, tenant: {} } } }));
 
     await login('a@b.com', 'pw');
 
     expect(session.token).toBe('access-1');
-    expect(session.refreshToken).toBe('refresh-1');
+    expect(JSON.stringify({ ...localStorage })).not.toContain('access-1');
+  });
+
+  it('sends cookies so the API can set and read the refresh cookie', async () => {
+    fetchMock.mockResolvedValueOnce(gql({ data: { login: { token: 'access-1', user: {}, tenant: {} } } }));
+    await login('a@b.com', 'pw');
+    expect(fetchMock.mock.calls[0][1].credentials).toBe('include');
+  });
+
+  it('clears the token on logout even if the API is unreachable', async () => {
+    session.set('access-1');
+    fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    await logout();
+    expect(session.token).toBeNull();
+  });
+});
+
+describe('restoreSession', () => {
+  it('exchanges the refresh cookie for an access token after a reload', async () => {
+    fetchMock.mockResolvedValueOnce(refreshed('access-2'));
+
+    const payload = await restoreSession();
+
+    expect(payload?.token).toBe('access-2');
+    expect(session.token).toBe('access-2');
+  });
+
+  it('returns null when there is no session to restore', async () => {
+    fetchMock.mockResolvedValueOnce(unauthenticated('No session'));
+    expect(await restoreSession()).toBeNull();
+    expect(session.token).toBeNull();
   });
 });
 
 describe('token refresh', () => {
-  it('rotates the refresh token and replays the original request', async () => {
-    session.save('expired-access', 'refresh-1');
-
+  it('refreshes and replays the original request with the new token', async () => {
+    session.set('expired-access');
     fetchMock
-      .mockResolvedValueOnce(
-        gql({ errors: [{ message: 'jwt expired', extensions: { code: 'UNAUTHENTICATED' } }] })
-      )
-      .mockResolvedValueOnce(
-        gql({ data: { refreshSession: { token: 'access-2', refreshToken: 'refresh-2', user: {}, tenant: {} } } })
-      )
+      .mockResolvedValueOnce(unauthenticated('jwt expired'))
+      .mockResolvedValueOnce(refreshed('access-2'))
       .mockResolvedValueOnce(gql({ data: { apiKeys: [{ id: 'key-1' }] } }));
 
-    const keys = await listApiKeys();
-
-    expect(keys).toEqual([{ id: 'key-1' }]);
-    expect(session.token).toBe('access-2');
-    expect(session.refreshToken).toBe('refresh-2');
-
-    // The replay must carry the new access token, not the expired one.
-    const replayHeaders = fetchMock.mock.calls[2][1].headers;
-    expect(replayHeaders.Authorization).toBe('Bearer access-2');
+    expect(await listApiKeys()).toEqual([{ id: 'key-1' }]);
+    expect(fetchMock.mock.calls[2][1].headers.Authorization).toBe('Bearer access-2');
   });
 
-  it('clears the session when the refresh token is also dead', async () => {
-    session.save('expired-access', 'refresh-dead');
+  // Each refresh rotates the cookie: two in flight at once would make the
+  // server see the old cookie reused and end the session.
+  it('shares one refresh between concurrent requests', async () => {
+    let resolveRefresh: (value: unknown) => void = () => {};
+    fetchMock.mockImplementation((_url: string, init: { body: string; headers: Record<string, string> }) => {
+      if (init.body.includes('refreshSession')) return new Promise((resolve) => (resolveRefresh = resolve));
+      return Promise.resolve(gql({ data: { apiKeys: [] } }));
+    });
 
+    const requests = [listApiKeys(), listApiKeys(), listApiKeys()];
+    await Promise.resolve();
+    resolveRefresh(refreshed('access-3'));
+    await Promise.all(requests);
+
+    const refreshCalls = fetchMock.mock.calls.filter(([, init]) => init.body.includes('refreshSession'));
+    expect(refreshCalls).toHaveLength(1);
+  });
+
+  it('ends the session when the refresh fails too', async () => {
+    const expired = vi.fn();
+    session.onExpired(expired);
+    session.set('expired-access');
     fetchMock
-      .mockResolvedValueOnce(
-        gql({ errors: [{ message: 'jwt expired', extensions: { code: 'UNAUTHENTICATED' } }] })
-      )
-      .mockResolvedValueOnce(
-        gql({ errors: [{ message: 'Invalid or expired refresh token', extensions: { code: 'UNAUTHENTICATED' } }] })
-      );
+      .mockResolvedValueOnce(unauthenticated('jwt expired'))
+      .mockResolvedValueOnce(unauthenticated('Invalid or expired refresh token'));
 
     await expect(listApiKeys()).rejects.toBeInstanceOf(ApiError);
     expect(session.token).toBeNull();
+    expect(expired).toHaveBeenCalledTimes(1);
   });
 
-  it('does not attempt a refresh for non-auth failures', async () => {
-    session.save('access-1', 'refresh-1');
-    fetchMock.mockResolvedValueOnce(
-      gql({ errors: [{ message: 'Alert rule not found', extensions: { code: 'NOT_FOUND' } }] })
-    );
+  it('does not refresh for non-auth failures', async () => {
+    session.set('access-1');
+    fetchMock.mockResolvedValueOnce(gql({ errors: [{ message: 'Not found', extensions: { code: 'NOT_FOUND' } }] }));
 
     await expect(listApiKeys()).rejects.toMatchObject({ code: 'NOT_FOUND' });
-    // One call: a NOT_FOUND is not going to be fixed by a fresh token.
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-  });
-
-  it('does not attempt a refresh when there is no refresh token', async () => {
-    fetchMock.mockResolvedValueOnce(
-      gql({ errors: [{ message: 'Authentication required', extensions: { code: 'UNAUTHENTICATED' } }] })
-    );
-
-    await expect(listApiKeys()).rejects.toBeInstanceOf(ApiError);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

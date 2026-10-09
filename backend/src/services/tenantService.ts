@@ -1,55 +1,47 @@
-import type { Tenant } from '@prisma/client'
+import { Prisma } from '@prisma/client'
 import { prisma } from '../prisma.js'
 import { generateApiKey } from './apiKeyService.js'
 
 function nextMonthlyResetDate(from: Date = new Date()): Date {
   const date = new Date(from)
-  date.setMonth(date.getMonth() + 1)
+  date.setUTCMonth(date.getUTCMonth() + 1)
   return date
 }
 
-export async function createTenant(name: string, domain: string): Promise<Tenant> {
-  const tenant = await prisma.tenant.create({
-    data: {
-      name,
-      domain,
-      plan: 'Free',
-      isActive: true,
-      maxUsers: 5,
-      maxApiKeys: 3,
-      monthlyEventLimit: 100000n,
-      monthlyResetDate: nextMonthlyResetDate(),
-    },
-  })
-
-  await prisma.apiKey.create({
-    data: {
-      tenantId: tenant.id,
-      name: 'Default API Key',
-      key: generateApiKey(),
-      environment: 'production',
-      isActive: true,
-    },
-  })
-
-  return tenant
+export function newTenantData(name: string, domain: string): Prisma.TenantCreateInput {
+  return {
+    name,
+    domain,
+    plan: 'Free',
+    isActive: true,
+    maxUsers: 5,
+    maxApiKeys: 3,
+    monthlyEventLimit: 100000n,
+    monthlyResetDate: nextMonthlyResetDate(),
+  }
 }
 
-export async function incrementEventCount(tenantId: string, count = 1): Promise<void> {
-  const now = new Date()
+export function defaultApiKeyData(tenantId: string): Prisma.ApiKeyUncheckedCreateInput {
+  return { tenantId, name: 'Default API Key', key: generateApiKey(), environment: 'production', isActive: true }
+}
 
-  // Atomic increment while the current monthly window is still open —
-  // one query in the common case, and no lost updates under concurrency.
-  const updated = await prisma.tenant.updateMany({
-    where: { id: tenantId, monthlyResetDate: { gte: now } },
-    data: { currentMonthEvents: { increment: count } },
-  })
-
-  if (updated.count === 0) {
-    // Window elapsed (or tenant missing): start a new month with this batch.
-    await prisma.tenant.updateMany({
-      where: { id: tenantId },
-      data: { currentMonthEvents: count, monthlyResetDate: nextMonthlyResetDate(now) },
-    })
-  }
+/**
+ * Adds `count` to the tenant's monthly usage, starting a new month when the
+ * window has elapsed. One statement, so concurrent ingests can neither lose
+ * increments nor both reset the window. (MySQL evaluates SET left to right;
+ * the reset date is assigned last so both conditions read the old value.)
+ */
+export async function incrementEventCount(
+  tenantId: string,
+  count: number,
+  db: Prisma.TransactionClient = prisma,
+  now = new Date()
+): Promise<void> {
+  const nextReset = nextMonthlyResetDate(now)
+  await db.$executeRaw`
+    UPDATE \`Tenant\`
+       SET currentMonthEvents = IF(monthlyResetDate >= ${now}, currentMonthEvents + ${count}, ${count}),
+           monthlyResetDate   = IF(monthlyResetDate >= ${now}, monthlyResetDate, ${nextReset})
+     WHERE id = ${tenantId}
+  `
 }

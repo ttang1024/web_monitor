@@ -1,6 +1,6 @@
 // Layer: page performance.
 // Navigation timing (DNS, TCP, TTFB, response, DOM, load) and Web Vitals
-// (FCP, LCP, CLS, FID) are captured automatically — nothing to call.
+// (FCP, LCP, CLS, INP) are captured automatically — nothing to call.
 // These helpers demonstrate what the numbers respond to, and how to add
 // your own timings for interface latency the browser can't infer.
 

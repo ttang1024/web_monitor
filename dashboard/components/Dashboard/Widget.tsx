@@ -2,7 +2,7 @@ import React, { useMemo } from 'react';
 import { WidgetConfig, ChartType, MetricType, TimeRange, WidgetDataPoint } from '../../types';
 import { SimpleLineChart, SimpleAreaChart, SimpleBarChart, SimplePieChart } from '../charts/BaseCharts';
 import { Icons } from '../ui/Icons';
-import { MOCK_COLORS } from '../../constants';
+import { CHART_COLORS } from '../../constants';
 import { useApi } from '../../hooks/useApi';
 import {
   DateRange,
@@ -27,18 +27,15 @@ interface WidgetProps {
   theme?: 'light' | 'dark';
 }
 
-/**
- * Every widget maps to a real query. Metrics the backend cannot answer yet
- * (JS heap, API latency percentiles) say so rather than drawing noise.
- */
+/** Every widget maps to a real query; there are no placeholder metrics. */
 async function loadWidgetData(
   metric: MetricType,
   chartType: ChartType,
   range: DateRange,
   bucket: 'hour' | 'day'
-): Promise<{ points: WidgetDataPoint[]; unsupported?: string }> {
+): Promise<{ points: WidgetDataPoint[] }> {
   switch (metric) {
-    case MetricType.ErrorRate: {
+    case MetricType.ErrorCount: {
       const stats = await dashboardStats(range);
       return {
         points: stats.errorTrend.labels.map((label, index) => ({
@@ -76,7 +73,7 @@ async function loadWidgetData(
         })),
       };
     }
-    case MetricType.UserSessions: {
+    case MetricType.PageViews: {
       const series = await performanceTimeSeries(range, bucket);
       return {
         points: series.map((point) => ({
@@ -85,7 +82,7 @@ async function loadWidgetData(
         })),
       };
     }
-    case MetricType.ApiFailure: {
+    case MetricType.ApiFailures: {
       const [apiErrors, series] = await Promise.all([
         listApiErrors({ page: 1, pageSize: 200, startDate: range.startDate }),
         performanceTimeSeries(range, bucket),
@@ -100,19 +97,10 @@ async function loadWidgetData(
 
       return { points: [...buckets.entries()].map(([time, value]) => ({ time, value })) };
     }
-    case MetricType.CLS: {
-      const series = await performanceTimeSeries(range, bucket);
-      return {
-        points: series.map((point) => ({ time: formatTimeLabel(point.timestamp, bucket), value: point.count })),
-      };
-    }
-    case MetricType.JsHeap: {
-      // Repurposed as the browser mix, which is what the SDK does report.
+    case MetricType.BrowserMix: {
       const slices = await deviceBreakdown('browser', range);
       return { points: slices.map((slice) => ({ name: slice.name, time: slice.name, value: slice.count })) };
     }
-    case MetricType.ApiLatency:
-      return { points: [], unsupported: 'The SDK does not report API latency yet — only failures.' };
     default:
       return { points: [] };
   }
@@ -140,18 +128,15 @@ export const Widget: React.FC<WidgetProps> = ({
   const points = useMemo(() => data?.points ?? [], [data]);
 
   const renderChart = () => {
-    const color = config.metric === MetricType.ErrorRate || config.metric === MetricType.ApiFailure
-      ? MOCK_COLORS.danger
-      : MOCK_COLORS.primary;
+    const color = config.metric === MetricType.ErrorCount || config.metric === MetricType.ApiFailures
+      ? CHART_COLORS.danger
+      : CHART_COLORS.primary;
 
     if (loading && !data) {
       return <div className="h-full flex items-center justify-center text-slate-400 text-sm">Loading…</div>;
     }
     if (error) {
       return <div className="h-full flex items-center justify-center text-red-500 text-sm px-4 text-center">{error}</div>;
-    }
-    if (data?.unsupported) {
-      return <div className="h-full flex items-center justify-center text-slate-400 text-xs px-6 text-center">{data.unsupported}</div>;
     }
     if (points.length === 0) {
       return <div className="h-full flex items-center justify-center text-slate-400 text-sm">No data in this window</div>;
@@ -212,7 +197,7 @@ export const Widget: React.FC<WidgetProps> = ({
             but we enable pointer events on buttons specifically */}
         <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-200 flex items-center gap-2 truncate">
           {config.title}
-          {config.metric === MetricType.ErrorRate && points.some((point) => Number(point.value) > 0) && (
+          {config.metric === MetricType.ErrorCount && points.some((point) => Number(point.value) > 0) && (
             <span className="flex h-2 w-2 relative">
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
               <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500"></span>

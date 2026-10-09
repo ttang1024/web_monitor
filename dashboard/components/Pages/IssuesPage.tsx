@@ -1,7 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import { Icons } from '../ui/Icons';
 import { SimpleLineChart, SparkLineChart } from '../charts/BaseCharts';
-import { MOCK_COLORS } from '../../constants';
+import { CHART_COLORS } from '../../constants';
 import { TimeRange } from '../../types';
 import { useApi } from '../../hooks/useApi';
 import {
@@ -213,7 +213,7 @@ const IssueDetailView: React.FC<IssueDetailProps> = ({ issue, trendHours, onBack
             {trend.loading && !trend.data ? (
               <div className="h-full flex items-center justify-center text-slate-400 text-sm">Loading trend…</div>
             ) : (
-              <SimpleLineChart data={graphData} color={MOCK_COLORS.danger} theme={theme} />
+              <SimpleLineChart data={graphData} color={CHART_COLORS.danger} theme={theme} />
             )}
           </div>
       </div>
@@ -543,7 +543,7 @@ const IssueRow: React.FC<IssueRowProps> = ({ issue, trendHours, compact, showGra
 
       {!compact && (
         <div className="col-span-2 h-8">
-          {showGraph && graphData.length > 0 && <SparkLineChart data={graphData} color={MOCK_COLORS.danger} theme={theme} />}
+          {showGraph && graphData.length > 0 && <SparkLineChart data={graphData} color={CHART_COLORS.danger} theme={theme} />}
         </div>
       )}
 

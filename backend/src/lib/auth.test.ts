@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import type { Tenant, User } from '@prisma/client'
+import type { User } from '@prisma/client'
 import {
+  burnPasswordCheck,
   generateJwtToken,
   generateRefreshToken,
   hashPassword,
@@ -15,29 +16,28 @@ const user = {
   tenantId: 'tenant-1',
   email: 'dev@example.com',
   role: 'Admin',
+  tokenVersion: 3,
 } as User
-
-const tenant = { id: 'tenant-1', name: 'Acme' } as Tenant
 
 describe('access tokens', () => {
   it('round-trips the claims the resolvers rely on', () => {
-    const claims = verifyJwtToken(generateJwtToken(user, tenant))
+    const claims = verifyJwtToken(generateJwtToken(user))
 
     expect(claims.userId).toBe('user-1')
     expect(claims.tenantId).toBe('tenant-1')
     expect(claims.email).toBe('dev@example.com')
     expect(claims.role).toBe('Admin')
-    expect(claims.tenantName).toBe('Acme')
+    expect(claims.tv).toBe(3)
   })
 
   it('rejects a tampered token', () => {
-    const token = generateJwtToken(user, tenant)
+    const token = generateJwtToken(user)
     const tampered = `${token.slice(0, -3)}abc`
     expect(() => verifyJwtToken(tampered)).toThrow()
   })
 
   it('gives each token its own id, so sessions are distinguishable', () => {
-    expect(generateJwtToken(user, tenant)).not.toBe(generateJwtToken(user, tenant))
+    expect(generateJwtToken(user)).not.toBe(generateJwtToken(user))
   })
 })
 
@@ -64,15 +64,19 @@ describe('refresh tokens', () => {
 })
 
 describe('passwords', () => {
-  it('verifies the right password and rejects the wrong one', () => {
-    const hash = hashPassword('correct horse battery staple')
+  it('verifies the right password and rejects the wrong one', async () => {
+    const hash = await hashPassword('correct horse battery staple')
 
     expect(hash).not.toContain('correct')
-    expect(verifyPassword('correct horse battery staple', hash)).toBe(true)
-    expect(verifyPassword('Correct horse battery staple', hash)).toBe(false)
+    expect(await verifyPassword('correct horse battery staple', hash)).toBe(true)
+    expect(await verifyPassword('Correct horse battery staple', hash)).toBe(false)
   })
 
-  it('salts, so the same password hashes differently each time', () => {
-    expect(hashPassword('same')).not.toBe(hashPassword('same'))
+  it('salts, so the same password hashes differently each time', async () => {
+    expect(await hashPassword('same')).not.toBe(await hashPassword('same'))
+  })
+
+  it('burns a full hash comparison for unknown accounts', async () => {
+    expect(await burnPasswordCheck('anything')).toBe(false)
   })
 })

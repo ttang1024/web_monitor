@@ -1,6 +1,9 @@
+import { Prisma } from '@prisma/client'
+import type { Tenant, User } from '@prisma/client'
 import { prisma } from '../prisma.js'
-import { UnauthorizedError, NotFoundError, BadRequestError } from '../lib/errors.js'
+import { BadRequestError, ForbiddenError, NotFoundError, UnauthorizedError } from '../lib/errors.js'
 import {
+  burnPasswordCheck,
   generateJwtToken,
   generateRefreshToken,
   hashPassword,
@@ -8,10 +11,9 @@ import {
   refreshTokenExpiry,
   verifyPassword,
 } from '../lib/auth.js'
-import * as tenantService from './tenantService.js'
-import { Prisma } from '@prisma/client'
-import type { LoginInput, RegisterInput } from '../types.js'
-import type { Tenant, User } from '@prisma/client'
+import { invalidateUserState } from '../context.js'
+import { newTenantData, defaultApiKeyData } from './tenantService.js'
+import type { LoginInput, RegisterInput, Role } from '../types.js'
 
 export interface UserDto {
   id: string
@@ -20,6 +22,8 @@ export interface UserDto {
   lastName: string
   role: string
   tenantId: string
+  isActive: boolean
+  lastLoginAt: Date | null
 }
 
 export interface TenantDto {
@@ -28,9 +32,11 @@ export interface TenantDto {
   domain: string
   plan: string
   isActive: boolean
+  maxUsers: number
 }
 
-export interface LoginResponse {
+/** What the GraphQL layer returns, plus the refresh token it puts in a cookie. */
+export interface Session {
   token: string
   refreshToken: string
   user: UserDto
@@ -45,6 +51,8 @@ function toUserDto(user: User): UserDto {
     lastName: user.lastName,
     role: user.role,
     tenantId: user.tenantId,
+    isActive: user.isActive,
+    lastLoginAt: user.lastLoginAt,
   }
 }
 
@@ -55,65 +63,19 @@ function toTenantDto(tenant: Tenant): TenantDto {
     domain: tenant.domain,
     plan: tenant.plan,
     isActive: tenant.isActive,
+    maxUsers: tenant.maxUsers,
   }
 }
 
 /** Issues an access token plus a persisted (hashed) refresh token. */
-async function issueSession(user: User, tenant: Tenant): Promise<LoginResponse> {
+async function issueSession(user: User, tenant: Tenant, db: Prisma.TransactionClient = prisma): Promise<Session> {
   const refreshToken = generateRefreshToken()
 
-  await prisma.refreshToken.create({
-    data: {
-      userId: user.id,
-      tokenHash: hashRefreshToken(refreshToken),
-      expiresAt: refreshTokenExpiry(),
-    },
+  await db.refreshToken.create({
+    data: { userId: user.id, tokenHash: hashRefreshToken(refreshToken), expiresAt: refreshTokenExpiry() },
   })
 
-  return {
-    token: generateJwtToken(user, tenant),
-    refreshToken,
-    user: toUserDto(user),
-    tenant: toTenantDto(tenant),
-  }
-}
-
-export async function register(input: RegisterInput): Promise<LoginResponse> {
-  // Checked up front so the common case gets a clear message without creating
-  // a tenant first — but this is not what guarantees uniqueness, since two
-  // simultaneous sign-ups can both pass it. The unique index below does.
-  const existingUser = await prisma.user.findUnique({ where: { email: input.email } })
-  if (existingUser) {
-    throw new BadRequestError('Email already registered')
-  }
-
-  const tenant = await tenantService.createTenant(input.tenantName, input.domain)
-
-  try {
-    const user = await prisma.user.create({
-      data: {
-        tenantId: tenant.id,
-        email: input.email,
-        passwordHash: hashPassword(input.password),
-        firstName: input.firstName,
-        lastName: input.lastName,
-        role: 'Admin',
-        isActive: true,
-      },
-    })
-
-    return issueSession(user, tenant)
-  } catch (error) {
-    // Lost the race for this address. The tenant created a moment ago now has
-    // no user and never will, so remove it rather than leave an orphan holding
-    // an API key.
-    await prisma.tenant.delete({ where: { id: tenant.id } }).catch(() => {})
-
-    if (isUniqueViolation(error, 'email')) {
-      throw new BadRequestError('Email already registered')
-    }
-    throw error
-  }
+  return { token: generateJwtToken(user), refreshToken, user: toUserDto(user), tenant: toTenantDto(tenant) }
 }
 
 /** True for Prisma's "unique constraint failed" on the given field. */
@@ -123,92 +85,202 @@ function isUniqueViolation(error: unknown, field: string): boolean {
   return Array.isArray(target) ? target.includes(field) : String(target ?? '').includes(field)
 }
 
-export async function login(input: LoginInput): Promise<LoginResponse> {
-  const user = await prisma.user.findFirst({
-    where: { email: input.email },
-    include: { tenant: true },
-  })
+export async function register(input: RegisterInput): Promise<Session> {
+  // Hashed outside the transaction so the slow part doesn't hold it open.
+  const passwordHash = await hashPassword(input.password)
 
-  if (!user || !verifyPassword(input.password, user.passwordHash)) {
-    throw new UnauthorizedError('Invalid credentials')
+  try {
+    // Tenant, its first API key and its admin are created together or not at
+    // all; the unique email index decides a race between two sign-ups.
+    return await prisma.$transaction(async (tx) => {
+      const tenant = await tx.tenant.create({ data: newTenantData(input.tenantName, input.domain) })
+      await tx.apiKey.create({ data: defaultApiKeyData(tenant.id) })
+      const user = await tx.user.create({
+        data: {
+          tenantId: tenant.id,
+          email: input.email,
+          passwordHash,
+          firstName: input.firstName,
+          lastName: input.lastName,
+          role: 'Admin',
+        },
+      })
+      return issueSession(user, tenant, tx)
+    })
+  } catch (error) {
+    if (isUniqueViolation(error, 'email')) throw new BadRequestError('Email already registered')
+    throw error
   }
+}
 
-  if (!user.isActive || !user.tenant.isActive) {
-    throw new UnauthorizedError('Account is inactive')
-  }
+export async function login(input: LoginInput): Promise<Session> {
+  const user = await prisma.user.findUnique({ where: { email: input.email }, include: { tenant: true } })
 
-  const updated = await prisma.user.update({
-    where: { id: user.id },
-    data: { lastLoginAt: new Date() },
-  })
+  const passwordOk = user ? await verifyPassword(input.password, user.passwordHash) : await burnPasswordCheck(input.password)
+  if (!user || !passwordOk) throw new UnauthorizedError('Invalid credentials')
 
+  if (!user.isActive || !user.tenant.isActive) throw new UnauthorizedError('Account is inactive')
+
+  const updated = await prisma.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } })
   return issueSession(updated, user.tenant)
 }
 
 /**
- * Exchanges a refresh token for a new session. The old token is revoked as
- * part of the swap (rotation), so a stolen token is usable at most once.
+ * A rotated-out token presented again within this window is treated as two
+ * tabs refreshing at once, not as theft: the request is refused, but the
+ * user's other sessions are left alone.
  */
-export async function refreshSession(refreshToken: string): Promise<LoginResponse> {
-  const tokenHash = hashRefreshToken(refreshToken)
+const ROTATION_GRACE_MS = 10_000
+
+/**
+ * Exchanges a refresh token for a new session, rotating the old one out.
+ *
+ * The swap is a single conditional update, so two concurrent requests with
+ * the same token cannot both succeed. A token that was rotated out longer ago
+ * than the grace window and is presented again means it was copied: every
+ * session the user has is revoked.
+ */
+export async function refreshSession(refreshToken: string | undefined, now = new Date()): Promise<Session> {
+  if (!refreshToken) throw new UnauthorizedError('No session')
+
   const stored = await prisma.refreshToken.findUnique({
-    where: { tokenHash },
+    where: { tokenHash: hashRefreshToken(refreshToken) },
     include: { user: { include: { tenant: true } } },
   })
+  if (!stored) throw new UnauthorizedError('Invalid or expired refresh token')
 
-  if (!stored || stored.revokedAt || stored.expiresAt < new Date()) {
+  if (stored.revokedAt) {
+    if (now.getTime() - stored.revokedAt.getTime() > ROTATION_GRACE_MS) {
+      await revokeAllSessions(stored.userId)
+    }
     throw new UnauthorizedError('Invalid or expired refresh token')
   }
 
-  if (!stored.user.isActive || !stored.user.tenant.isActive) {
-    throw new UnauthorizedError('Account is inactive')
-  }
+  if (stored.expiresAt < now) throw new UnauthorizedError('Invalid or expired refresh token')
+  if (!stored.user.isActive || !stored.user.tenant.isActive) throw new UnauthorizedError('Account is inactive')
 
-  await prisma.refreshToken.update({
-    where: { id: stored.id },
-    data: { revokedAt: new Date() },
+  const { count } = await prisma.refreshToken.updateMany({
+    where: { id: stored.id, revokedAt: null },
+    data: { revokedAt: now },
   })
+  if (count === 0) throw new UnauthorizedError('Invalid or expired refresh token')
 
   return issueSession(stored.user, stored.user.tenant)
 }
 
-/** Revokes one refresh token (this device) or, with no token, every session. */
-export async function logout(userId: string, refreshToken?: string | null): Promise<void> {
-  const where = refreshToken
-    ? { userId, tokenHash: hashRefreshToken(refreshToken), revokedAt: null }
-    : { userId, revokedAt: null }
-
-  await prisma.refreshToken.updateMany({ where, data: { revokedAt: new Date() } })
-}
-
-export async function getUserById(userId: string): Promise<UserDto> {
-  const user = await prisma.user.findUnique({ where: { id: userId } })
-  if (!user) throw new NotFoundError('User not found')
-  return toUserDto(user)
-}
-
-export async function getTenantById(tenantId: string): Promise<TenantDto> {
-  const tenant = await prisma.tenant.findUnique({ where: { id: tenantId } })
-  if (!tenant) throw new NotFoundError('Tenant not found')
-  return toTenantDto(tenant)
-}
-
-export async function changePassword(userId: string, currentPassword: string, newPassword: string): Promise<void> {
-  const user = await prisma.user.findUnique({ where: { id: userId } })
-  if (!user) throw new NotFoundError('User not found')
-
-  if (!verifyPassword(currentPassword, user.passwordHash)) {
-    throw new UnauthorizedError('Current password is incorrect')
-  }
-
-  await prisma.user.update({
-    where: { id: userId },
-    data: { passwordHash: hashPassword(newPassword) },
-  })
-
-  // A password change invalidates every session issued under the old one.
+/** Revokes this device's refresh token. The short-lived access token simply expires. */
+export async function logout(userId: string, refreshToken: string | undefined): Promise<void> {
+  if (!refreshToken) return
   await prisma.refreshToken.updateMany({
-    where: { userId, revokedAt: null },
+    where: { userId, tokenHash: hashRefreshToken(refreshToken), revokedAt: null },
     data: { revokedAt: new Date() },
   })
+}
+
+/** Revokes the session a refresh token belongs to, when no access token is at hand. */
+export async function logoutByToken(refreshToken: string): Promise<void> {
+  await prisma.refreshToken.updateMany({
+    where: { tokenHash: hashRefreshToken(refreshToken), revokedAt: null },
+    data: { revokedAt: new Date() },
+  })
+}
+
+/** Ends every session: refresh tokens are revoked and outstanding access tokens stop verifying. */
+export async function revokeAllSessions(userId: string, db: Prisma.TransactionClient = prisma): Promise<void> {
+  await db.refreshToken.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date() } })
+  await db.user.update({ where: { id: userId }, data: { tokenVersion: { increment: 1 } } })
+  invalidateUserState(userId)
+}
+
+// --- Team -------------------------------------------------------------------
+
+export async function listUsers(tenantId: string): Promise<UserDto[]> {
+  const users = await prisma.user.findMany({
+    where: { tenantId },
+    orderBy: [{ isActive: 'desc' }, { createdAt: 'asc' }],
+  })
+  return users.map(toUserDto)
+}
+
+export interface CreateUserInput {
+  email: string
+  firstName: string
+  lastName: string
+  role: Role
+  initialPassword: string
+}
+
+export async function createUser(tenantId: string, input: CreateUserInput): Promise<UserDto> {
+  const passwordHash = await hashPassword(input.initialPassword)
+
+  try {
+    return await prisma.$transaction(
+      async (tx) => {
+        const tenant = await tx.tenant.findUniqueOrThrow({ where: { id: tenantId } })
+        const activeUsers = await tx.user.count({ where: { tenantId, isActive: true } })
+        if (activeUsers >= tenant.maxUsers) {
+          throw new BadRequestError(`Plan allows at most ${tenant.maxUsers} active users`)
+        }
+
+        const user = await tx.user.create({
+          data: {
+            tenantId,
+            email: input.email,
+            firstName: input.firstName,
+            lastName: input.lastName,
+            role: input.role,
+            passwordHash,
+          },
+        })
+        return toUserDto(user)
+      },
+      // Serializable so two concurrent invites can't both pass the seat check.
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+    )
+  } catch (error) {
+    if (isUniqueViolation(error, 'email')) throw new BadRequestError('Email already registered')
+    throw error
+  }
+}
+
+export async function updateUser(
+  tenantId: string,
+  actorId: string,
+  userId: string,
+  changes: { role?: Role; isActive?: boolean }
+): Promise<UserDto> {
+  return prisma.$transaction(
+    async (tx) => {
+      const user = await tx.user.findFirst({ where: { id: userId, tenantId } })
+      if (!user) throw new NotFoundError('User not found')
+
+      const losesAdmin =
+        user.role === 'Admin' && user.isActive && (changes.role === 'User' || changes.isActive === false)
+      if (losesAdmin) {
+        if (userId === actorId) throw new ForbiddenError('You cannot remove your own admin access')
+        const otherAdmins = await tx.user.count({
+          where: { tenantId, role: 'Admin', isActive: true, id: { not: userId } },
+        })
+        if (otherAdmins === 0) throw new BadRequestError('A tenant must keep at least one active admin')
+      }
+
+      if (changes.isActive === true && !user.isActive) {
+        const tenant = await tx.tenant.findUniqueOrThrow({ where: { id: tenantId } })
+        const activeUsers = await tx.user.count({ where: { tenantId, isActive: true } })
+        if (activeUsers >= tenant.maxUsers) {
+          throw new BadRequestError(`Plan allows at most ${tenant.maxUsers} active users`)
+        }
+      }
+
+      const updated = await tx.user.update({
+        where: { id: userId },
+        data: { role: changes.role ?? undefined, isActive: changes.isActive ?? undefined },
+      })
+
+      if (changes.isActive === false) await revokeAllSessions(userId, tx)
+      invalidateUserState(userId)
+      return toUserDto(updated)
+    },
+    { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+  )
 }

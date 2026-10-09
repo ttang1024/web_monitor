@@ -1,3 +1,5 @@
+# Development services only: run the API itself from source with `npm run dev`.
+# Ports are bound to localhost, so the dev database isn't reachable from the network.
 services:
   mysql:
     image: mysql:8
@@ -7,9 +9,16 @@ services:
       MYSQL_ROOT_PASSWORD: yourpassword
       MYSQL_DATABASE: monitoring_saas
     ports:
-      - '3306:3306'
+      - '127.0.0.1:3306:3306'
     volumes:
       - monitoring-mysql-data:/var/lib/mysql
+
+  # Optional: set REDIS_URL=redis://localhost:6379 to share rate limits.
+  redis:
+    image: redis:7-alpine
+    container_name: monitoring-redis
+    ports:
+      - '127.0.0.1:6379:6379'
 
 volumes:
   monitoring-mysql-data:

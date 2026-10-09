@@ -1,8 +1,6 @@
-const INGEST_BATCH_MUTATION = `
-	mutation IngestBatch($input: BatchIngestInput!) {
-		ingestBatch(input: $input)
-	}
-`
+// Browsers cap a keepalive fetch or sendBeacon body at 64KB in total; staying
+// under it means the final flush on page hide actually gets out.
+const MAX_REQUEST_BYTES = 60 * 1024
 
 const DEFAULT_OPTIONS = {
 	baseUrl: 'https://api.yourmonitoring.com',
@@ -16,6 +14,10 @@ const DEFAULT_OPTIONS = {
 	flowTimeout: 30000,
 	instrumentFetch: true,
 	instrumentXhr: true,
+	// Successful requests at least this slow (ms) are reported as slow_request; 0 turns it off.
+	slowRequestMs: 3000,
+	// Count single-page-app URL changes (history.pushState, back/forward) as page views.
+	trackRouteChanges: true,
 	// Ceiling for the backoff applied after failed flushes.
 	maxRetryDelay: 5 * 60 * 1000,
 }
@@ -34,14 +36,19 @@ class MonitoringSDK {
 		this.finalized = false
 		this.consecutiveFailures = 0
 		this.nextRetryAt = 0
+		this.retryBatch = null
+		this.sending = false
 
 		this.userId = this.options.userId || null
 		this.sessionId = this.resolveSessionId()
 		this.samplePerformance = Math.random() < this.options.sampleRate
 
 		// Web Vitals accumulated over the page's lifetime, reported once on first hide.
-		this.vitals = { lcp: null, cls: null, fid: null }
+		this.vitals = { lcp: null, cls: null, inp: null }
 		this.clsSession = { value: 0, entries: [] }
+		// The slowest interactions seen so far, for INP.
+		this.interactions = []
+		this.interactionCount = 0
 
 		// Keep an unpatched fetch for the SDK's own transport.
 		this.transportFetch =
@@ -59,6 +66,7 @@ class MonitoringSDK {
 		// capture: true so resource load failures (img/script/link) are seen too.
 		window.addEventListener('error', this.onWindowError, true)
 		window.addEventListener('unhandledrejection', this.onRejection)
+		this.drainEarlyErrors()
 
 		// --- API monitoring ---
 		if (this.options.instrumentFetch) this.instrumentFetch()
@@ -69,6 +77,7 @@ class MonitoringSDK {
 			this.observeWebVitals()
 			this.captureNavigationTiming()
 		}
+		if (this.samplePerformance && this.options.trackRouteChanges) this.instrumentHistory()
 
 		// --- Transport ---
 		this.flushTimer = setInterval(() => this.flush(), this.options.flushInterval)
@@ -182,12 +191,27 @@ class MonitoringSDK {
 	recordError(error) {
 		// The backend requires a non-null message; cross-origin scripts can emit errors without one.
 		error.message = error.message || 'Unknown error'
-		const signature = `${error.type}|${error.message}|${error.source || ''}|${error.lineNo || ''}`
-		const count = (this.errorCounts.get(signature) || 0) + 1
-		this.errorCounts.set(signature, count)
-		if (count > this.options.maxErrorRepeats) return
+		if (this.overRepeatCap(`${error.type}|${error.message}|${error.source || ''}|${error.lineNo || ''}`)) return
 
 		this.addToBatch('errors', { ...error, ...this.baseFields() })
+	}
+
+	// True once the same signature has been reported maxErrorRepeats times on this page.
+	overRepeatCap(signature) {
+		const count = (this.errorCounts.get(signature) || 0) + 1
+		this.errorCounts.set(signature, count)
+		return count > this.options.maxErrorRepeats
+	}
+
+	// Errors the inline snippet (see README) caught before the SDK loaded.
+	drainEarlyErrors() {
+		const early = window.__monitorQueue
+		window.__monitorQueue = null
+		if (!Array.isArray(early)) return
+		for (const event of early) {
+			if (event.type === 'unhandledrejection') this.handleRejection(event)
+			else this.handleWindowError(event)
+		}
 	}
 
 	// ------------------------------------------------------------------
@@ -210,16 +234,13 @@ class MonitoringSDK {
 
 			const method = (init.method || (typeof input === 'object' && input.method) || 'GET').toUpperCase()
 			const start = performance.now()
+			const elapsed = () => Math.round(performance.now() - start)
 			try {
 				const response = await original(input, init)
-				if (response.status >= 400) {
-					this.captureApiError(url, method, response.status, {
-						message: `HTTP ${response.status} ${response.statusText} (${Math.round(performance.now() - start)}ms)`.trim(),
-					})
-				}
+				this.recordResponse(url, method, response.status, response.statusText, elapsed())
 				return response
 			} catch (error) {
-				this.captureApiError(url, method, null, error)
+				this.captureApiError(url, method, null, error, elapsed())
 				throw error
 			}
 		}
@@ -244,30 +265,50 @@ class MonitoringSDK {
 		proto.send = function (...args) {
 			const info = this._monitoring
 			if (info && !sdk.isOwnRequest(info.url)) {
+				const start = performance.now()
+				const elapsed = () => Math.round(performance.now() - start)
 				this.addEventListener('load', () => {
-					if (this.status >= 400) {
-						sdk.captureApiError(info.url, info.method, this.status, {
-							message: `HTTP ${this.status} ${this.statusText}`.trim(),
-						})
-					}
+					sdk.recordResponse(info.url, info.method, this.status, this.statusText, elapsed())
 				})
 				this.addEventListener('error', () => {
-					sdk.captureApiError(info.url, info.method, null, { message: 'Network error' })
+					sdk.captureApiError(info.url, info.method, null, { message: 'Network error' }, elapsed())
 				})
 				this.addEventListener('timeout', () => {
-					sdk.captureApiError(info.url, info.method, null, { message: 'Request timed out' })
+					sdk.captureApiError(info.url, info.method, null, { message: 'Request timed out' }, elapsed())
 				})
 			}
 			return sdk.originalXhrSend.apply(this, args)
 		}
 	}
 
-	captureApiError(requestUrl, method, status, error) {
+	// A completed request: an HTTP error, a slow success, or nothing to report.
+	recordResponse(requestUrl, method, status, statusText, durationMs) {
+		if (status >= 400) {
+			this.captureApiError(requestUrl, method, status, { message: `HTTP ${status} ${statusText}`.trim() }, durationMs)
+			return
+		}
+		const limit = this.options.slowRequestMs
+		if (!limit || durationMs < limit) return
+		// A slow endpoint polled in a loop is capped like a repeating error.
+		if (this.overRepeatCap(`slow|${method}|${requestUrl}`)) return
+		this.addToBatch('apiErrors', {
+			type: 'slow_request',
+			requestUrl,
+			method,
+			status,
+			durationMs,
+			message: `Took ${durationMs}ms`,
+			...this.baseFields(),
+		})
+	}
+
+	captureApiError(requestUrl, method, status, error, durationMs) {
 		this.addToBatch('apiErrors', {
 			type: status ? 'http_error' : 'network_error',
 			requestUrl,
 			method,
 			status,
+			durationMs,
 			message: error?.message,
 			...this.baseFields(),
 		})
@@ -305,18 +346,38 @@ class MonitoringSDK {
 			}
 		})
 
-		this.tryObserve('first-input', entries => {
-			const first = entries[0]
-			if (first && this.vitals.fid === null) {
-				this.vitals.fid = first.processingStart - first.startTime
-			}
-		})
+		// INP: input to next paint for every interaction. 40ms is the lowest
+		// threshold browsers honour; first-input catches a fast first tap too.
+		const onInteractions = entries => entries.forEach(entry => this.recordInteraction(entry))
+		this.tryObserve('event', onInteractions, { durationThreshold: 40 })
+		this.tryObserve('first-input', onInteractions)
 	}
 
-	tryObserve(type, callback) {
+	/**
+	 * INP is the slowest interaction on the page, ignoring one outlier for
+	 * every 50 interactions. Keeping the ten slowest is enough to answer that
+	 * for pages with up to 500 interactions, the same shortcut web-vitals takes.
+	 */
+	recordInteraction(entry) {
+		if (!entry.interactionId) return
+		const existing = this.interactions.find(i => i.id === entry.interactionId)
+		if (existing) {
+			existing.duration = Math.max(existing.duration, entry.duration)
+		} else {
+			this.interactionCount += 1
+			this.interactions.push({ id: entry.interactionId, duration: entry.duration })
+		}
+		this.interactions.sort((a, b) => b.duration - a.duration)
+		this.interactions.length = Math.min(this.interactions.length, 10)
+
+		const index = Math.min(Math.floor(this.interactionCount / 50), this.interactions.length - 1)
+		this.vitals.inp = this.interactions[index].duration
+	}
+
+	tryObserve(type, callback, options = {}) {
 		try {
 			const observer = new PerformanceObserver(list => callback(list.getEntries()))
-			observer.observe({ type, buffered: true })
+			observer.observe({ type, buffered: true, ...options })
 			this.observers.push(observer)
 		} catch {
 			// Entry type not supported in this browser — skip it.
@@ -335,6 +396,7 @@ class MonitoringSDK {
 				this.addToBatch('performance', {
 					...this.baseFields(),
 					device: this.deviceInfo(),
+					navigationType: 'load',
 					metrics: {
 						dns: entry.domainLookupEnd - entry.domainLookupStart,
 						tcp: entry.connectEnd - entry.connectStart,
@@ -353,18 +415,43 @@ class MonitoringSDK {
 		else window.addEventListener('load', send, { once: true })
 	}
 
-	// LCP/CLS/FID keep growing until the user leaves; report them once, on first hide.
+	// LCP/CLS/INP keep growing until the user leaves; report them once, on first hide.
 	reportVitals() {
 		if (!this.samplePerformance) return
-		const { lcp, cls, fid } = this.vitals
-		if (lcp === null && cls === null && fid === null) return
+		const { lcp, cls, inp } = this.vitals
+		if (lcp === null && cls === null && inp === null) return
 
 		this.addToBatch('performance', {
 			...this.baseFields(),
 			device: this.deviceInfo(),
-			metrics: { lcp, cls, fid },
+			metrics: { lcp, cls, inp },
 		})
-		this.vitals = { lcp: null, cls: null, fid: null }
+		this.vitals = { lcp: null, cls: null, inp: null }
+	}
+
+	// Single-page apps change the URL without loading a page. Each change is a
+	// page view; it carries no load timings, since the browser measures none.
+	instrumentHistory() {
+		this.lastPath = location.pathname + location.search
+		this.onRouteChange = () => {
+			const path = location.pathname + location.search
+			if (path === this.lastPath) return
+			this.lastPath = path
+			this.addToBatch('performance', {
+				...this.baseFields(),
+				device: this.deviceInfo(),
+				navigationType: 'route',
+				metrics: {},
+			})
+		}
+
+		this.originalPushState = history.pushState
+		history.pushState = (...args) => {
+			const result = this.originalPushState.apply(history, args)
+			this.onRouteChange()
+			return result
+		}
+		window.addEventListener('popstate', this.onRouteChange)
 	}
 
 	// ------------------------------------------------------------------
@@ -465,62 +552,118 @@ class MonitoringSDK {
 		return batch
 	}
 
-	// A response the backend will never accept — bad API key, malformed or
-	// oversized payload. Retrying it just burns requests forever, so it is
-	// dropped. 408/429 are the exceptions: those do succeed later.
+	newBatchId() {
+		const random =
+			typeof crypto !== 'undefined' && crypto.randomUUID
+				? crypto.randomUUID()
+				: `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`
+		return `b_${random}`.replace(/[^\w-]/g, '').slice(0, 64)
+	}
+
+	/**
+	 * Takes as many queued events as fit in one request, oldest first. An event
+	 * too large to fit on its own is dropped rather than blocking the queue.
+	 * The batch id travels with the batch through retries, so the backend can
+	 * tell a retry of a batch it already stored from a new one.
+	 */
+	takeBatch() {
+		const items = []
+		const batchId = this.newBatchId()
+		while (this.batchQueue.length > 0) {
+			const candidate = [...items, this.batchQueue[0]]
+			const size = JSON.stringify({ batchId, ...this.mergeBatch(candidate) }).length
+			if (size > MAX_REQUEST_BYTES) {
+				if (items.length === 0) this.batchQueue.shift()
+				else break
+			} else {
+				items.push(this.batchQueue.shift())
+			}
+		}
+		return items.length ? { batchId, items } : null
+	}
+
+	ingestUrl() {
+		// Key in the query string and a text/plain body make this a CORS "simple
+		// request": no preflight per batch, and exactly what sendBeacon can send.
+		return `${this.baseUrl}/ingest?key=${encodeURIComponent(this.apiKey)}`
+	}
+
+	body(batch) {
+		return JSON.stringify({ batchId: batch.batchId, ...this.mergeBatch(batch.items) })
+	}
+
+	// Rejections that will never succeed: bad key, malformed or oversized
+	// payload. 408/429 (and 5xx) do succeed later, so those are retried.
 	isPermanentFailure(status) {
 		return status >= 400 && status < 500 && status !== 408 && status !== 429
 	}
 
 	async flush({ final = false } = {}) {
-		if (this.batchQueue.length === 0 || !this.transportFetch) return
+		if (!this.transportFetch) return
 		// Backing off after a failure — but a final flush always tries.
 		if (!final && Date.now() < this.nextRetryAt) return
+		if (final) return this.flushOnUnload()
+		// One request at a time keeps ordering simple and the retry slot single.
+		if (this.sending) return
 
-		const items = this.batchQueue
-		this.batchQueue = []
+		// A batch that failed before is resent first, with its original id.
+		const batch = this.retryBatch || this.takeBatch()
+		this.retryBatch = null
+		if (!batch) return
 
+		this.sending = true
 		try {
-			const response = await this.transportFetch(`${this.baseUrl}/graphql`, {
+			const response = await this.transportFetch(this.ingestUrl(), {
 				method: 'POST',
-				headers: {
-					'Content-Type': 'application/json',
-					'X-API-Key': this.apiKey,
-				},
-				body: JSON.stringify({
-					query: INGEST_BATCH_MUTATION,
-					variables: { input: this.mergeBatch(items) },
-				}),
-				// keepalive lets the final flush survive page unload.
-				keepalive: final,
+				headers: { 'Content-Type': 'text/plain' },
+				body: this.body(batch),
 			})
 
-			if (!response.ok) {
-				if (this.isPermanentFailure(response.status)) {
-					this.onFlushSucceeded()
-					if (!final) console.error(`Monitoring batch rejected (HTTP ${response.status}), dropped`)
-					return
-				}
-				throw new Error(`HTTP ${response.status}`)
+			if (response.ok) return this.onFlushSucceeded()
+
+			if (this.isPermanentFailure(response.status)) {
+				this.onFlushSucceeded()
+				const detail = await response.json().catch(() => null)
+				console.error(`Monitoring batch rejected (HTTP ${response.status})${detail?.error ? `: ${detail.error}` : ''}`)
+				return
 			}
 
-			// GraphQL reports rejected input as 200 + an errors array. Those are
-			// permanent too, so the batch is dropped rather than replayed.
-			if (!final) {
-				const body = await response.json().catch(() => null)
-				if (body?.errors?.length) {
-					this.onFlushSucceeded()
-					console.error('Monitoring batch rejected:', body.errors[0]?.message)
-					return
-				}
-			}
-
-			this.onFlushSucceeded()
+			const retryAfter = Number(response.headers?.get?.('Retry-After'))
+			throw Object.assign(new Error(`HTTP ${response.status}`), { retryAfterMs: retryAfter > 0 ? retryAfter * 1000 : 0 })
 		} catch (error) {
-			// Put the items back so a later interval retries them.
-			this.batchQueue = [...items, ...this.batchQueue].slice(-this.options.maxQueueSize)
-			this.onFlushFailed()
-			if (!final) console.error('Failed to send monitoring data:', error)
+			this.retryBatch = batch
+			this.onFlushFailed(error?.retryAfterMs)
+			console.error('Failed to send monitoring data:', error)
+		} finally {
+			this.sending = false
+		}
+	}
+
+	/**
+	 * On page hide there is no time to wait for responses. Everything left is
+	 * handed to sendBeacon (which the browser delivers after the page is gone),
+	 * falling back to a keepalive fetch where sendBeacon is missing or refuses.
+	 */
+	flushOnUnload() {
+		const batches = []
+		if (this.retryBatch) batches.push(this.retryBatch)
+		this.retryBatch = null
+		for (let batch = this.takeBatch(); batch; batch = this.takeBatch()) batches.push(batch)
+
+		for (const batch of batches) {
+			const body = this.body(batch)
+			const beaconed =
+				typeof navigator !== 'undefined' &&
+				typeof navigator.sendBeacon === 'function' &&
+				navigator.sendBeacon(this.ingestUrl(), new Blob([body], { type: 'text/plain' }))
+			if (!beaconed) {
+				this.transportFetch(this.ingestUrl(), {
+					method: 'POST',
+					headers: { 'Content-Type': 'text/plain' },
+					body,
+					keepalive: true,
+				}).catch(() => {})
+			}
 		}
 	}
 
@@ -531,13 +674,14 @@ class MonitoringSDK {
 
 	// Exponential backoff with jitter: a backend that is down (or a browser that
 	// is offline) sees one retry every few minutes instead of one every tick.
-	onFlushFailed() {
+	// A server-specified Retry-After is honoured when it is longer.
+	onFlushFailed(retryAfterMs = 0) {
 		this.consecutiveFailures += 1
 		const delay = Math.min(
 			this.options.flushInterval * 2 ** (this.consecutiveFailures - 1),
 			this.options.maxRetryDelay
 		)
-		this.nextRetryAt = Date.now() + delay * (0.5 + Math.random() * 0.5)
+		this.nextRetryAt = Date.now() + Math.max(delay * (0.5 + Math.random() * 0.5), retryAfterMs)
 	}
 
 	// Called when the page is hidden or unloading: close out vitals and
@@ -565,6 +709,8 @@ class MonitoringSDK {
 		if (this.originalFetch) window.fetch = this.originalFetch
 		if (this.originalXhrOpen) XMLHttpRequest.prototype.open = this.originalXhrOpen
 		if (this.originalXhrSend) XMLHttpRequest.prototype.send = this.originalXhrSend
+		if (this.originalPushState) history.pushState = this.originalPushState
+		window.removeEventListener('popstate', this.onRouteChange)
 		this.flush({ final: true })
 	}
 }

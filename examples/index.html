@@ -4,6 +4,15 @@
 		<meta charset="UTF-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
 		<title>Monitoring SDK Examples</title>
+		<!-- Holds errors thrown before the SDK starts; see "Catch errors before the SDK loads" in the README. -->
+		<script>
+			window.__monitorQueue = []
+			;['error', 'unhandledrejection'].forEach(function (type) {
+				addEventListener(type, function (event) {
+					if (window.__monitorQueue) window.__monitorQueue.push(event)
+				}, true)
+			})
+		</script>
 		<style>
 			body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
 			h2 { margin-top: 2rem; font-size: 1.1rem; }

@@ -1,25 +1,28 @@
 import React, { useState } from 'react';
 import { Icons } from '../ui/Icons';
-import { analyzeDashboard } from '../../services/geminiService';
-import { DashboardState, AIAnalysisResponse } from '../../types';
+import { analyzeDashboard, AIAnalysisResult, DateRange } from '../../services/api';
+import { DashboardState } from '../../types';
 
 interface Props {
   dashboardState: DashboardState;
-  /** Live metrics for the current window, serialized for the model. */
-  metricsSummary: string;
+  /** The window on screen; the server reads the metrics for it from the tenant's own data. */
+  range: DateRange;
   onClose: () => void;
 }
 
-export const AIAnalysisPanel: React.FC<Props> = ({ dashboardState, metricsSummary, onClose }) => {
+export const AIAnalysisPanel: React.FC<Props> = ({ dashboardState, range, onClose }) => {
   const [loading, setLoading] = useState(false);
-  const [analysis, setAnalysis] = useState<AIAnalysisResponse | null>(null);
+  const [analysis, setAnalysis] = useState<AIAnalysisResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const handleAnalyze = async () => {
     setLoading(true);
     setError(null);
     try {
-      const result = await analyzeDashboard(dashboardState, metricsSummary);
+      const result = await analyzeDashboard({
+        timeRange: dashboardState.timeRange,
+        ...range,
+      });
       setAnalysis(result);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to analyze data.");

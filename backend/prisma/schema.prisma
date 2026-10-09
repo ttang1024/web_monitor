@@ -57,15 +57,15 @@ model Tenant {
   createdAt          DateTime         @default(now())
   updatedAt          DateTime?        @updatedAt
 
-  users             User[]
-  apiKeys           ApiKey[]
-  errorLogs         ErrorLog[]
-  errorBuckets      ErrorBucket[]
+  users              User[]
+  apiKeys            ApiKey[]
+  errorLogs          ErrorLog[]
+  errorBuckets       ErrorBucket[]
   performanceMetrics PerformanceMetric[]
-  apiErrors         ApiError[]
-  customEvents      CustomEvent[]
-  dashboardLayouts  DashboardLayout[]
-  alertRules        AlertRule[]
+  apiErrors          ApiError[]
+  customEvents       CustomEvent[]
+  dashboardLayouts   DashboardLayout[]
+  alertRules         AlertRule[]
   alertNotifications AlertNotification[]
 }
 
@@ -79,6 +79,9 @@ model User {
   role         UserRole  @default(User)
   isActive     Boolean   @default(true)
   lastLoginAt  DateTime?
+  // Bumped to invalidate every access token issued so far (password change,
+  // deactivation, "log out everywhere"). Carried in the JWT and compared on use.
+  tokenVersion Int       @default(0)
   createdAt    DateTime  @default(now())
   updatedAt    DateTime? @updatedAt
 
@@ -130,16 +133,16 @@ model ApiKey {
 }
 
 model ErrorLog {
-  id              String    @id @default(uuid()) @db.Char(36)
-  tenantId        String    @db.Char(36)
+  id              String      @id @default(uuid()) @db.Char(36)
+  tenantId        String      @db.Char(36)
   type            String
-  message         String    @db.Text
-  stackTrace      String?   @db.Text
+  message         String      @db.Text
+  stackTrace      String?     @db.Text
   source          String?
   lineNumber      Int?
   columnNumber    Int?
-  url             String    @db.Text
-  userAgent       String    @db.Text
+  url             String      @db.Text
+  userAgent       String      @db.Text
   timestamp       BigInt
   errorHash       String
   occurrenceCount Int         @default(1)
@@ -154,6 +157,8 @@ model ErrorLog {
   @@unique([tenantId, errorHash])
   @@index([tenantId, createdAt])
   @@index([tenantId, status, lastSeenAt])
+  // Retention removes issues that have not recurred within the window.
+  @@index([lastSeenAt])
 }
 
 // Errors collapse into one ErrorLog row per hash, which loses their shape over time.
@@ -169,34 +174,40 @@ model ErrorBucket {
 
   @@unique([tenantId, errorHash, bucketStart])
   @@index([tenantId, bucketStart])
+  @@index([bucketStart])
 }
 
 model PerformanceMetric {
-  id            String    @id @default(uuid()) @db.Char(36)
-  tenantId      String    @db.Char(36)
-  url           String    @db.Text
-  userAgent     String    @db.Text
-  timestamp     BigInt
-  lcp           Float?
-  fcp           Float?
-  cls           Float?
-  fid           Float?
-  ttfb          Float?
-  dnsTime       Float?
-  tcpTime       Float?
-  responseTime  Float?
-  domLoadTime   Float?
-  loadTime      Float?
-  deviceType    String?
-  browser       String?
-  os            String?
-  country       String?
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime? @updatedAt
+  id             String    @id @default(uuid()) @db.Char(36)
+  tenantId       String    @db.Char(36)
+  url            String    @db.Text
+  userAgent      String    @db.Text
+  timestamp      BigInt
+  lcp            Float?
+  fcp            Float?
+  cls            Float?
+  inp            Float?
+  ttfb           Float?
+  dnsTime        Float?
+  tcpTime        Float?
+  responseTime   Float?
+  domLoadTime    Float?
+  loadTime       Float?
+  // "load" for a full page load, "route" for a single-page-app URL change.
+  // Null on the SDK's separate Web Vitals row, and on rows from older SDKs.
+  navigationType String?
+  deviceType     String?
+  browser        String?
+  os             String?
+  country        String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime? @updatedAt
 
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
   @@index([tenantId, createdAt])
+  // Retention deletes across all tenants by age; the tenant-leading index can't serve that.
+  @@index([createdAt])
 }
 
 model ApiError {
@@ -206,6 +217,7 @@ model ApiError {
   requestUrl      String    @db.Text
   method          String    @default("GET")
   statusCode      Int?
+  durationMs      Float?
   errorMessage    String?   @db.Text
   pageUrl         String    @db.Text
   userAgent       String    @db.Text
@@ -218,6 +230,7 @@ model ApiError {
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
   @@index([tenantId, createdAt])
+  @@index([createdAt])
 }
 
 model CustomEvent {
@@ -236,31 +249,32 @@ model CustomEvent {
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
   @@index([tenantId, eventName, createdAt])
+  @@index([createdAt])
 }
 
 // A condition the tenant wants to hear about. Evaluated on a fixed interval
 // against the window ending now, not on the ingest path — a burst of 500 errors
 // should cost one evaluation, not 500.
 model AlertRule {
-  id       String         @id @default(uuid()) @db.Char(36)
-  tenantId String         @db.Char(36)
-  name     String
-  condition AlertCondition
+  id              String         @id @default(uuid()) @db.Char(36)
+  tenantId        String         @db.Char(36)
+  name            String
+  condition       AlertCondition
   // Interpreted per condition: occurrences (ErrorSpike), percent (ErrorRate),
   // milliseconds (SlowPageLoad). Ignored by NewIssue.
-  threshold Float         @default(0)
-  windowMinutes Int       @default(60)
-  severity AlertSeverity  @default(Warning)
-  isEnabled Boolean       @default(true)
+  threshold       Float          @default(0)
+  windowMinutes   Int            @default(60)
+  severity        AlertSeverity  @default(Warning)
+  isEnabled       Boolean        @default(true)
   // A condition that stays true would otherwise fire on every sweep. After a
   // rule triggers it stays quiet for this long.
-  cooldownMinutes Int     @default(60)
+  cooldownMinutes Int            @default(60)
   lastTriggeredAt DateTime?
   // Optional outbound POST when the rule fires. Notifications are recorded
   // either way, so delivery failing never loses the alert.
-  webhookUrl String?      @db.Text
-  createdAt DateTime      @default(now())
-  updatedAt DateTime?     @updatedAt
+  webhookUrl      String?        @db.Text
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime?      @updatedAt
 
   tenant        Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   notifications AlertNotification[]
@@ -271,21 +285,21 @@ model AlertRule {
 // One firing of a rule. Kept even when webhook delivery fails so the dashboard
 // is always the complete record.
 model AlertNotification {
-  id          String        @id @default(uuid()) @db.Char(36)
-  tenantId    String        @db.Char(36)
-  alertRuleId String        @db.Char(36)
-  title       String
-  body        String        @db.Text
-  severity    AlertSeverity
+  id            String        @id @default(uuid()) @db.Char(36)
+  tenantId      String        @db.Char(36)
+  alertRuleId   String        @db.Char(36)
+  title         String
+  body          String        @db.Text
+  severity      AlertSeverity
   // What the rule measured, against what it was compared to.
   observedValue Float
-  threshold   Float
+  threshold     Float
   // Set for NewIssue, so the dashboard can link straight to the issue.
-  errorHash   String?
-  isRead      Boolean       @default(false)
-  deliveredAt DateTime?
-  deliveryError String?     @db.Text
-  createdAt   DateTime      @default(now())
+  errorHash     String?
+  isRead        Boolean       @default(false)
+  deliveredAt   DateTime?
+  deliveryError String?       @db.Text
+  createdAt     DateTime      @default(now())
 
   tenant Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   rule   AlertRule @relation(fields: [alertRuleId], references: [id], onDelete: Cascade)
@@ -293,6 +307,7 @@ model AlertNotification {
   @@index([tenantId, createdAt])
   @@index([tenantId, isRead])
   @@index([alertRuleId])
+  @@index([createdAt])
 }
 
 model DashboardLayout {
@@ -308,6 +323,26 @@ model DashboardLayout {
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  // One layout per name per user, so saving is an upsert rather than a pile of copies.
+  @@unique([userId, name])
   @@index([tenantId])
-  @@index([userId])
+}
+
+// Batch ids the SDK has already delivered. A retried batch whose first attempt
+// did commit is recognised here and skipped instead of being counted twice.
+// Rows only need to outlive the SDK's retry horizon, so retention prunes them daily.
+model IngestBatch {
+  tenantId  String   @db.Char(36)
+  batchId   String   @db.VarChar(64)
+  createdAt DateTime @default(now())
+
+  @@id([tenantId, batchId])
+  @@index([createdAt])
+}
+
+// Lease that elects one API instance to run the background sweeps.
+model SchedulerLease {
+  name      String   @id @db.VarChar(64)
+  holder    String   @db.VarChar(64)
+  expiresAt DateTime
 }

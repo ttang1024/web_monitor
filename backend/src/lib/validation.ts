@@ -1,5 +1,15 @@
 import { z, ZodSchema, ZodTypeAny } from 'zod'
 import { BadRequestError } from './errors.js'
+import { isAllowedWebhookUrl } from './safeWebhook.js'
+
+/** An absolute http(s) URL. */
+const isHttpUrl = (value: string): boolean => {
+  try {
+    return ['http:', 'https:'].includes(new URL(value).protocol)
+  } catch {
+    return false
+  }
+}
 
 export const registerSchema = z.object({
   email: z.string().min(1, 'Email is required').email('Invalid email address'),
@@ -15,11 +25,6 @@ export const loginSchema = z.object({
   password: z.string().min(1, 'Password is required'),
 })
 
-export const changePasswordSchema = z.object({
-  currentPassword: z.string().min(1, 'Current password is required'),
-  newPassword: z.string().min(8, 'Password must be at least 8 characters').max(200),
-})
-
 export const createApiKeySchema = z.object({
   name: z.string().min(1, 'Name is required').max(100),
   environment: z.enum(['production', 'staging', 'development']).default('production'),
@@ -30,19 +35,13 @@ export const createApiKeySchema = z.object({
 const alertCondition = z.enum(['NewIssue', 'ErrorSpike', 'ErrorRate', 'SlowPageLoad'])
 const alertSeverity = z.enum(['Info', 'Warning', 'Critical'])
 
-// Only http(s) is accepted, and only an absolute URL: the rule's webhook is a
-// server-side outbound request the tenant controls, so it must not be
-// addressable at other schemes.
+// The webhook is a server-side request to a tenant-chosen URL: http(s) only,
+// and never an internal address. Delivery re-checks the resolved address.
 const webhookUrl = z
   .string()
   .max(2_048)
-  .refine((value) => {
-    try {
-      return ['http:', 'https:'].includes(new URL(value).protocol)
-    } catch {
-      return false
-    }
-  }, 'Webhook must be an http(s) URL')
+  .refine(isHttpUrl, 'Webhook must be an http(s) URL')
+  .refine((value) => isAllowedWebhookUrl(value), 'Webhook may not point at a private or internal address')
 
 export const createAlertRuleSchema = z.object({
   name: z.string().min(1, 'Name is required').max(120),
@@ -63,16 +62,7 @@ export const updateAlertRuleSchema = createAlertRuleSchema.partial()
 // allowlist silently matches nothing.
 export const allowedOriginsSchema = z
   .array(
-    z
-      .string()
-      .max(255)
-      .refine((value) => {
-        try {
-          return ['http:', 'https:'].includes(new URL(value).protocol)
-        } catch {
-          return false
-        }
-      }, 'Each origin must be an http(s) URL, e.g. https://app.example.com')
+    z.string().max(255).refine(isHttpUrl, 'Each origin must be an http(s) URL, e.g. https://app.example.com')
   )
   .max(50, 'At most 50 origins per key')
 
@@ -118,11 +108,12 @@ export const ingestErrorSchema = z.object({
 
 export const ingestPerformanceSchema = z.object({
   ...baseEventFields,
+  navigationType: z.enum(['load', 'route']).nullish(),
   metrics: z.object({
     lcp: timing,
     fcp: timing,
     cls: z.number().finite().nonnegative().max(1_000).nullish(),
-    fid: timing,
+    inp: timing,
     ttfb: timing,
     dns: timing,
     tcp: timing,
@@ -146,6 +137,7 @@ export const ingestApiErrorSchema = z.object({
   requestUrl: z.string().min(1).max(MAX_URL),
   method: z.string().min(1).max(10),
   status: z.number().int().min(0).max(999).nullish(),
+  durationMs: timing,
   message: z.string().max(MAX_MESSAGE).nullish(),
   requestHeaders: z.record(z.string()).nullish(),
   responseHeaders: z.record(z.string()).nullish(),
@@ -159,14 +151,74 @@ export const ingestCustomEventSchema = z.object({
   sessionId: z.string().max(200).nullish(),
 })
 
-const batchList = <T extends ZodSchema>(schema: T) =>
-  z.array(schema).max(MAX_BATCH_EVENTS, `Batch may not exceed ${MAX_BATCH_EVENTS} events per type`).nullish()
+const batchList = <T extends ZodSchema>(schema: T) => z.array(schema).max(MAX_BATCH_EVENTS).nullish()
 
-export const batchIngestSchema = z.object({
-  errors: batchList(ingestErrorSchema),
-  performance: batchList(ingestPerformanceSchema),
-  apiErrors: batchList(ingestApiErrorSchema),
-  customEvents: batchList(ingestCustomEventSchema),
+export const batchIngestSchema = z
+  .object({
+    // Set by the SDK per batch and reused on retry, so a batch whose first
+    // attempt committed is not stored twice.
+    batchId: z.string().min(8).max(64).regex(/^[\w-]+$/).nullish(),
+    errors: batchList(ingestErrorSchema),
+    performance: batchList(ingestPerformanceSchema),
+    apiErrors: batchList(ingestApiErrorSchema),
+    customEvents: batchList(ingestCustomEventSchema),
+  })
+  .refine(
+    (batch) => batchEventCount(batch) <= MAX_BATCH_EVENTS,
+    `Batch may not exceed ${MAX_BATCH_EVENTS} events in total`
+  )
+
+export type BatchIngestInput = z.output<typeof batchIngestSchema>
+export type IngestErrorInput = z.output<typeof ingestErrorSchema>
+export type IngestPerformanceInput = z.output<typeof ingestPerformanceSchema>
+export type IngestApiErrorInput = z.output<typeof ingestApiErrorSchema>
+export type IngestCustomEventInput = z.output<typeof ingestCustomEventSchema>
+
+/** Number of events in a batch, counted leniently so it also works on unvalidated input. */
+export function batchEventCount(input: unknown): number {
+  if (!input || typeof input !== 'object') return 0
+  const batch = input as Record<string, unknown>
+  return ['errors', 'performance', 'apiErrors', 'customEvents'].reduce(
+    (sum, key) => sum + (Array.isArray(batch[key]) ? (batch[key] as unknown[]).length : 0),
+    0
+  )
+}
+
+// --- Dashboard --------------------------------------------------------------
+
+export const saveLayoutSchema = z.object({
+  name: z.string().min(1).max(100),
+  isDefault: z.boolean().default(false),
+  configuration: jsonRecord(64 * 1024).nullish(),
+})
+
+// --- Team -------------------------------------------------------------------
+
+const userRole = z.enum(['User', 'Admin'])
+
+export const createUserSchema = z.object({
+  email: z.string().min(1, 'Email is required').email('Invalid email address'),
+  firstName: z.string().min(1, 'First name is required').max(100),
+  lastName: z.string().min(1, 'Last name is required').max(100),
+  role: userRole.default('User'),
+  // Set by the admin and handed over out of band; the user changes it after signing in.
+  initialPassword: z.string().min(8, 'Password must be at least 8 characters').max(200),
+})
+
+export const updateUserSchema = z.object({
+  role: userRole.optional(),
+  isActive: z.boolean().optional(),
+})
+
+// --- AI analysis --------------------------------------------------------------
+// Only the window is taken from the client; the metrics themselves are read
+// from the tenant's own data on the server, so a caller can't feed the model
+// numbers of its choosing.
+
+export const aiAnalysisInputSchema = z.object({
+  timeRange: z.string().max(50),
+  startDate: z.date().nullish(),
+  endDate: z.date().nullish(),
 })
 
 /**

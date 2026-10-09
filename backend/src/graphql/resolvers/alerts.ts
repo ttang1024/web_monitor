@@ -1,7 +1,7 @@
 import type { AlertNotification } from '@prisma/client'
 import * as alertService from '../../services/alertService.js'
 import { createAlertRuleSchema, updateAlertRuleSchema, validate } from '../../lib/validation.js'
-import { requireAuth } from '../guards.js'
+import { requireAdmin, requireAuth } from '../guards.js'
 import type { GraphQLContext } from '../../types.js'
 
 interface NotificationParent extends AlertNotification {
@@ -33,27 +33,20 @@ export const alertResolvers = {
 
   Mutation: {
     createAlertRule: async (_: unknown, { input }: { input: unknown }, ctx: GraphQLContext) => {
-      const auth = requireAuth(ctx)
+      const auth = requireAdmin(ctx)
       const validated = validate(createAlertRuleSchema, input)
       alertService.assertUsableRule(validated)
       return alertService.createAlertRule(auth.tenantId, validated)
     },
 
     updateAlertRule: async (_: unknown, { id, input }: { id: string; input: unknown }, ctx: GraphQLContext) => {
-      const auth = requireAuth(ctx)
-      const validated = validate(updateAlertRuleSchema, input)
-
-      // Only checkable when both halves are present: a patch that changes just
-      // the threshold has to be judged against the rule's existing condition.
-      if (validated.condition !== undefined && validated.threshold !== undefined) {
-        alertService.assertUsableRule({ condition: validated.condition, threshold: validated.threshold })
-      }
-
-      return alertService.updateAlertRule(auth.tenantId, id, validated)
+      const auth = requireAdmin(ctx)
+      // The service checks the rule as it will be after the patch.
+      return alertService.updateAlertRule(auth.tenantId, id, validate(updateAlertRuleSchema, input))
     },
 
     deleteAlertRule: async (_: unknown, { id }: { id: string }, ctx: GraphQLContext) => {
-      const auth = requireAuth(ctx)
+      const auth = requireAdmin(ctx)
       return alertService.deleteAlertRule(auth.tenantId, id)
     },
 

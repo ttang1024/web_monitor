@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const prismaMock = {
-  alertRule: { findMany: vi.fn(), update: vi.fn() },
+  alertRule: { findMany: vi.fn(), updateMany: vi.fn() },
   alertNotification: { create: vi.fn(), update: vi.fn() },
   errorLog: { findFirst: vi.fn() },
   errorBucket: { aggregate: vi.fn() },
@@ -10,7 +10,13 @@ const prismaMock = {
   customEvent: { count: vi.fn() },
 }
 
+const postWebhook = vi.fn()
+
 vi.mock('../prisma.js', () => ({ prisma: prismaMock }))
+vi.mock('../lib/safeWebhook.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../lib/safeWebhook.js')>()),
+  postWebhook,
+}))
 
 const { assertUsableRule, evaluateAlertRules, isInCooldown } = await import('./alertService.js')
 const { BadRequestError } = await import('../lib/errors.js')
@@ -41,7 +47,7 @@ beforeEach(() => {
   prismaMock.alertNotification.create.mockImplementation(({ data }: { data: Record<string, unknown> }) =>
     Promise.resolve({ id: 'notification-1', createdAt: NOW, ...data })
   )
-  prismaMock.alertRule.update.mockResolvedValue({})
+  prismaMock.alertRule.updateMany.mockResolvedValue({ count: 1 })
   prismaMock.alertNotification.update.mockImplementation(({ data }: { data: Record<string, unknown> }) =>
     Promise.resolve({ id: 'notification-1', createdAt: NOW, ...data })
   )
@@ -104,10 +110,43 @@ describe('evaluateAlertRules', () => {
 
     await evaluateAlertRules(NOW)
 
-    expect(prismaMock.alertRule.update).toHaveBeenCalledWith({
-      where: { id: 'rule-1' },
-      data: { lastTriggeredAt: NOW },
-    })
+    expect(prismaMock.alertRule.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ id: 'rule-1' }), data: { lastTriggeredAt: NOW } })
+    )
+  })
+
+  it('does not fire when another sweep already claimed the rule', async () => {
+    prismaMock.alertRule.findMany.mockResolvedValue([rule()])
+    prismaMock.errorBucket.aggregate.mockResolvedValue({ _sum: { count: 150 } })
+    prismaMock.alertRule.updateMany.mockResolvedValue({ count: 0 })
+
+    expect(await evaluateAlertRules(NOW)).toEqual([])
+    expect(prismaMock.alertNotification.create).not.toHaveBeenCalled()
+  })
+
+  it('only reports issues first seen after the rule last fired', async () => {
+    const lastTriggeredAt = new Date(NOW.getTime() - 90 * 60 * 1000)
+    prismaMock.alertRule.findMany.mockResolvedValue([
+      rule({ condition: 'NewIssue', threshold: 0, windowMinutes: 24 * 60, lastTriggeredAt }),
+    ])
+    prismaMock.errorLog.findFirst.mockResolvedValue(null)
+
+    await evaluateAlertRules(NOW)
+
+    expect(prismaMock.errorLog.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { tenantId: 'tenant-1', createdAt: { gt: lastTriggeredAt } } })
+    )
+  })
+
+  it('reads hourly buckets on UTC hour boundaries', async () => {
+    prismaMock.alertRule.findMany.mockResolvedValue([rule({ windowMinutes: 30 })])
+    await evaluateAlertRules(new Date('2026-08-04T12:20:00.000Z'))
+
+    expect(prismaMock.errorBucket.aggregate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { tenantId: 'tenant-1', bucketStart: { gte: new Date('2026-08-04T11:00:00.000Z') } },
+      })
+    )
   })
 
   it('reports a NewIssue with the hash so the dashboard can link to it', async () => {
@@ -175,16 +214,15 @@ describe('evaluateAlertRules', () => {
     const fired = await evaluateAlertRules(NOW)
 
     expect(fired).toHaveLength(1)
-    expect(prismaMock.alertRule.update).toHaveBeenCalledWith({
-      where: { id: 'healthy' },
-      data: { lastTriggeredAt: NOW },
-    })
+    expect(prismaMock.alertRule.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ id: 'healthy' }) })
+    )
   })
 
   it('records the notification even when webhook delivery fails', async () => {
     prismaMock.alertRule.findMany.mockResolvedValue([rule({ webhookUrl: 'https://hooks.example.com/x' })])
     prismaMock.errorBucket.aggregate.mockResolvedValue({ _sum: { count: 150 } })
-    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('connect ECONNREFUSED')))
+    postWebhook.mockRejectedValue(new Error('connect ECONNREFUSED'))
 
     const fired = await evaluateAlertRules(NOW)
 
@@ -192,25 +230,31 @@ describe('evaluateAlertRules', () => {
     expect(prismaMock.alertNotification.update).toHaveBeenCalledWith(
       expect.objectContaining({ data: { deliveryError: 'connect ECONNREFUSED' } })
     )
-    vi.unstubAllGlobals()
+  })
+
+  it('treats a redirect as a failed delivery rather than following it', async () => {
+    prismaMock.alertRule.findMany.mockResolvedValue([rule({ webhookUrl: 'https://hooks.example.com/x' })])
+    prismaMock.errorBucket.aggregate.mockResolvedValue({ _sum: { count: 150 } })
+    postWebhook.mockResolvedValue({ status: 302 })
+
+    await evaluateAlertRules(NOW)
+
+    expect(prismaMock.alertNotification.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { deliveryError: 'Webhook responded 302' } })
+    )
   })
 
   it('marks a notification delivered on a successful webhook', async () => {
     prismaMock.alertRule.findMany.mockResolvedValue([rule({ webhookUrl: 'https://hooks.example.com/x' })])
     prismaMock.errorBucket.aggregate.mockResolvedValue({ _sum: { count: 150 } })
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 })
-    vi.stubGlobal('fetch', fetchMock)
+    postWebhook.mockResolvedValue({ status: 200 })
 
     await evaluateAlertRules(NOW)
 
-    expect(fetchMock).toHaveBeenCalledWith(
-      'https://hooks.example.com/x',
-      expect.objectContaining({ method: 'POST' })
-    )
+    expect(postWebhook).toHaveBeenCalledWith('https://hooks.example.com/x', expect.objectContaining({ rule: 'Spike' }))
     expect(prismaMock.alertNotification.update).toHaveBeenCalledWith(
       expect.objectContaining({ data: { deliveredAt: expect.any(Date) } })
     )
-    vi.unstubAllGlobals()
   })
 })
 
